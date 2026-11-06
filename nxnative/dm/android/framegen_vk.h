@@ -37,6 +37,7 @@ typedef struct {
     int initialized;           // 1 when all resources are valid
     int active;                // DM_FRAMEGEN=1 and shader pack found
     uint32_t num_swapchain;    // number of swapchain images (for collision tracking)
+    VkExtent2D ext;            // extent the flip chain images were created for
 } framegen_t;
 
 // Initialize the flip chain and pipeline (called once during vk_present_init).
