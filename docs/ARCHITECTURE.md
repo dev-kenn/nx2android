@@ -150,6 +150,28 @@ nx2android/
 
 The engine is our own fork since 2026-10-29: no subtree pull from upstream, and no `upstream` remote ([DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md#nxnative)).
 
+## Optional LSFG frame generation
+
+`--framegen` / `--lsfg-dll <Lossless.dll>` enables an optional post-process that reads each of the game's final composited frames and produces an interpolated frame, potentially increasing effective presentation rate. The runtime feature is controlled by `DM_FRAMEGEN=1` (written to `env.txt` when `--framegen` or `--lsfg-dll` is given).
+
+### How it works
+
+| Stage | Where | What |
+|---|---|---|
+| **Extraction** | `porter lsfg-extract <dll>` on the host | Reads Lossless.dll, finds DXBC shader blobs, writes `.lsfgpack` bundle (metadata.json + shaders/*.dxbc). Transpilation to SPIR-V requires `dxc` or `dxcompiler`. |
+| **Packaging** | `porter port --framegen --lsfg-dll ...` | The .lsfgpack goes into the data pack (`env.txt` gets `DM_FRAMEGEN=1`, `DM_LSFG_PATH`). |
+| **Runtime** | `nxnative/dm/android/framegen_vk.c` | Reads `DM_FRAMEGEN=1` and `DM_LSFG_PATH` at init. Creates a flip chain, applies LSFG post-process in `vk_present()`, blits result to swapchain. No-op when inactive. |
+
+### Integration points
+
+- **Porter**: `pipeline.py` · `Port.lsfg_extract()` runs after `fps_unlock()` and before `rewrite()`. Sets `self.lsfg_env` / `self.lsfg_files` for the data pack.
+- **Vulkan present path**: `gfx_vk_present.c` · `framegen_init()` in `swap_make()`, `framegen_destroy()` in `swap_destroy()`, `framegen_submit()` between the PRESENT_SRC barrier and `vkEndCommandBuffer`.
+- **Header**: `nxnative/dm/android/framegen_vk.h` declares the public interface.
+
+### Performance notes
+
+Mobile GPU VRAM bandwidth makes 1440p frame generation likely infeasible for complex 3D games. Optimal use case is 2D/menu-driven games at 720p–900p targeting 30→60 fps upscaling. See `docs/framegen-plan.md` for the full design document.
+
 ## Adding a game
 
 1. `python -m porter port <folder> --experimental --install`: the survey, a provisional profile and a first try on the device. Bring it up from there with the upstream tools and `devtools/` (docs in `nxnative/docs/agents`): the profile moves to `dm/games/<title ID>/`, fixes go into the core as general rules.

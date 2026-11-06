@@ -31,6 +31,10 @@ def _parser():
     po.add_argument('--mt-replay', action='store_true',
                     help='multithread replay: the game\'s Vulkan commands are recorded on a thread of their own (DM_VK_MT_REPLAY=1 in env.txt), for a game whose replay '
                          'thread holds its frame rate back; it needs a port again (or env.txt edited) to turn off')
+    po.add_argument('--framegen', action='store_true',
+                    help='enable optional LSFG-style frame generation: the runtime uses post-process shaders to produce intermediate frames')
+    po.add_argument('--lsfg-dll', default=None, metavar='FILE',
+                    help='path to a user-supplied Lossless.dll for extracting frame-generation shaders (implies --framegen)')
     po.add_argument('--vulkan-driver', default=None, metavar='FILE',
                     help='an arm64 Vulkan driver library (.so, such as Mesa\'s Turnip for Adreno) to pack in the APK and use instead of the device\'s own driver '
                          '(DM_VK_DRIVER in env.txt); the app falls back to the device\'s driver when the library does not load')
@@ -65,6 +69,10 @@ def _parser():
     si = svs.add_parser('import', help="a save folder or .zip as the game's save (a console's, as its save tools copy it, or an export); the save it replaces is exported first on the device")
     si.add_argument('src', help='the save folder (its files at the top, as the game keeps them) or a .zip of it; <folder>.device beside it is the device save')
     si.add_argument('--name', default='', help="its folder name on the device (default: the folder's or the .zip's)")
+    le = sub.add_parser('lsfg-extract', help='extract LSFG framegen shaders from Lossless.dll')
+    le.add_argument('dll', help='path to the extracted Lossless.dll')
+    le.add_argument('--out', default=None, help='output directory (default: <dll>/lsfg/)')
+    le.add_argument('--force', action='store_true', help='overwrite existing outputs')
     for x in (sa, sl, se, si):
         x.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)'); x.add_argument('--json', action='store_true')
         if x is not sa: x.add_argument('--package', default='', help='the app (default: the only ported game installed)')
@@ -152,7 +160,8 @@ def cmd_port(a):
     except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, jobs=a.jobs,
+                            framegen=a.framegen or (a.lsfg_dll is not None), lsfg_dll=Path(a.lsfg_dll).resolve() if a.lsfg_dll else None)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -237,7 +246,22 @@ def cmd_saves(a):
     return 0
 
 
+def cmd_lsfg_extract(a):
+    """Extract LSFG framegen shaders from Lossless.dll and produce a .lsfgpack bundle."""
+    import sys
+    from porter import lsfg_extract as lsfg
+    dll = Path(a.dll)
+    if not dll.is_file():
+        print(f'[lsfg] not a file: {dll}', file=sys.stderr)
+        return 1
+    out = Path(a.out) if a.out else dll.with_suffix('') / 'lsfg'
+    blobs = lsfg.extract_dll(dll, out, force=a.force)
+    for b in blobs[:20]: print(f'  blob: {b.checksum[:8]} name={b.name} ver={b.version or "-"} size={b.size:,}')
+    if len(blobs) > 20: print(f'  ... and {len(blobs) - 20} more')
+    return 0
+
+
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'lsfg_extract': cmd_lsfg_extract}[a.cmd](a)

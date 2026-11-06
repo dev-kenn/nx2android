@@ -42,6 +42,8 @@ class Options:
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
     romfs_at: str = None               # with install: the folder on the device the app reads the RomFS from (porter/install.py), 'app' for its files folder; None: as the device has it
     romfs_push: bool = False           # with romfs_at: push the pack's RomFS into that folder first
+    framegen: bool = False             # LSFG-style frame generation: DM_FRAMEGEN=1 in env.txt (porter/lsfg_extract.py, dm/android/framegen_vk.c)
+    lsfg_dll: Path = None              # path to a user-supplied Lossless.dll for extracting framegen shaders (implies --framegen)
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -187,6 +189,8 @@ class Port:
         os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))   # where nx_extract.exe's apphost looks for the runtime (else the system's, which may lack .NET 10)
         # PYTHONUTF8: the engine's tools write their tables with open() and no encoding, which is the ANSI code page on Windows (shader_split.py's "→" failed)
         self.env = dict(os.environ, J=str(o.jobs), PYTHONIOENCODING='utf-8', PYTHONUTF8='1', DOTNET_CLI_TELEMETRY_OPTOUT='1')
+        self.lsfg_env = []      # framegen env.txt rows (set by lsfg_extract when --framegen)
+        self.lsfg_files = {}    # framegen shader files to pack (set by lsfg_extract)
 
         try:
             self.inputs()
@@ -195,6 +199,7 @@ class Port:
         finally: self.drop_unpacked()   # a failed run leaves no decompressed dumps behind either
         self.check_graphics()
         self.fps_unlock()
+        self.lsfg_extract()
         self.rewrite()
         if o.install: self.pull_captures()
         self.shaders()
@@ -571,6 +576,40 @@ class Port:
         say(f'60 fps: FPSLocker-Warehouse config {src}, by masagrator and contributors: {n} memory write(s)' + (f', {len(cuts)} code cut(s)' if cuts else ''))
         PROG.end(f'{n} memory write(s)' + (f', {len(cuts)} code cut(s)' if cuts else ''))
 
+    # ---- LSFG framegen: extract shaders from user-supplied Lossless.dll ----
+    def lsfg_extract(self):
+        """Extract frame-generation shaders from a user-supplied Lossless.dll.
+        
+        Runs early (after fps_unlock, before rewrite). Produces no runtime impact when
+        --framegen / --lsfg-dll is not given. When both are provided but the DLL is absent,
+        warns and continues without framegen (never fails the port).
+        """
+        o = self.o
+        if not (o.framegen or o.lsfg_dll): return   # nothing to do, defaults already set
+        
+        if not o.lsfg_dll or not o.lsfg_dll.is_file():
+            say('[RED] --framegen given but no --lsfg-dll: frame generation is disabled')
+            self.lsfg_env = []; self.lsfg_files = {}
+            return
+
+        from porter import lsfg_extract as _lsfg
+        out_dir = self.work / 'lsfg'
+        say(f'[lsfg] extracting framegen shaders from {o.lsfg_dll.name}')
+        
+        try:
+            blobs = _lsfg.extract_dll(o.lsfg_dll, out_dir)
+            if not blobs:
+                say('[RED] --framegen: no DXBC shader blobs in Lossless.dll (frame generation will be skipped at runtime)')
+                self.lsfg_env = []; self.lsfg_files = {}
+                return
+            
+            self.lsfg_env = [f'DM_FRAMEGEN=1', f'DM_LSFG_PATH={datapack.files_folder(self.package)}/lsfg/']
+            self.lsfg_files = {f'lsfg/{b.checksum[:8]}.dxbc': out_dir / 'shaders' / f'{b.checksum}.dxbc' for b in blobs[:64]}
+            say(f'[lsfg] done: {len(blobs)} blob(s), {len(self.lsfg_files)} file(s) packed')
+        except Exception as e:
+            say(f'[RED] --framegen: extraction failed ({e}): frame generation disabled, port continues')
+            self.lsfg_env = []; self.lsfg_files = {}
+
     # ---- rewrite: patch_nso.py for the Android host's thread slots ----
     def rewrite(self):
         self.patched = self.aw / f'patched_{self.pkg_ver}'   # beside, not over, an iOS build's patched_<version>: the rewrite's reuse key does not include the target
@@ -715,9 +754,9 @@ class Port:
             font_env, font_files = font_env + [f'DM_SHARED_FONT={datapack.files_folder(self.package)}/standard.ttf'], {**font_files, 'standard.ttf': self.o.shared_font}
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
-                             aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
+                             aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env + self.lsfg_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + ([f'DM_VK_DRIVER={self.o.vulkan_driver.name}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files},
+                             files={**self.fps_files, **self.lsfg_files, **font_files},
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

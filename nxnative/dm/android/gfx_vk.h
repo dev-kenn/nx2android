@@ -174,3 +174,7 @@ void vk_present_init(void);
 uint64_t vk_present(const tex_t *t, double period, const int crop[4]);
 enum { PT_DISPATCH = 0xd15 };   // vk_pass_ts: a dispatch timed as a pass (its format field)
 
+// ---- frame generation (framegen_vk.c, optional LSFG post-process) ----
+void framegen_init(void);        // called from vk_present_init() when --framegen
+void framegen_destroy(void);     // called during swapchain recreation
+

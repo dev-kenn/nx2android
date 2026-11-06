@@ -14,6 +14,7 @@
 #include "overlay_frag.spv.h"
 #include "rot_vert.spv.h"
 #include "rot_frag.spv.h"
+#include "framegen_vk.h"
 
 __attribute__((weak)) ANativeWindow *dm_front_window(void) { return NULL; }
 __attribute__((weak)) int dm_external_active(void) { return 0; }
@@ -95,6 +96,7 @@ static void rot_drop_image(void) {
     g_rot.view = VK_NULL_HANDLE; g_rot.img = VK_NULL_HANDLE; g_rot.mem = VK_NULL_HANDLE;
 }
 static void swap_destroy(void) {
+    framegen_destroy();  // LSFG: tear down flip chain before the swapchain
     pace_reset();
     present_time_reset();
     if (g_swap) { vkDeviceWaitIdle(V.dev); ov_fb_drop(); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
@@ -167,6 +169,7 @@ static int swap_make(void) {
     if (g_swap) return 1;
     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, w};
     if (vkCreateAndroidSurfaceKHR(V.inst, &si, NULL, &g_surf)) return 0;
+    framegen_init();  // LSFG post-process: called once when the swapchain is created
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &caps);
     uint32_t nf = 0; vkGetPhysicalDeviceSurfaceFormatsKHR(V.pd, g_surf, &nf, NULL); VkSurfaceFormatKHR sf[32]; if (nf > 32) nf = 32; vkGetPhysicalDeviceSurfaceFormatsKHR(V.pd, g_surf, &nf, sf);
     g_sfmt = sf[0].format; for (uint32_t i = 0; i < nf; i++) if (sf[i].format == VK_FORMAT_R8G8B8A8_UNORM) g_sfmt = sf[i].format;
@@ -889,6 +892,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
         vkCmdEndRendering(cb);
         barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    framegen_submit(cb, g_simg[idx], g_pre == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ? g_sext : g_next);  // LSFG post-process (no-op when inactive)
     vkEndCommandBuffer(cb);
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
