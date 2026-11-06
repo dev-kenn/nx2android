@@ -114,7 +114,7 @@ static VkImage create_flip_image(VkDevice dev, VkExtent2D ext, VkDeviceMemory *o
     ic.mipLevels = 1; ic.arrayLayers = 1;
     ic.samples = VK_SAMPLE_COUNT_1_BIT;
     ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImage img;
@@ -174,7 +174,7 @@ static bool create_flip_chain(framegen_t *fg, VkExtent2D ext) {
     ic.imageType = VK_IMAGE_TYPE_2D; ic.format = VK_FORMAT_R8G8B8A8_UNORM;
     ic.extent.width = ext.width; ic.extent.height = ext.height; ic.extent.depth = 1; ic.mipLevels = 1; ic.arrayLayers = 1;
     ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     for (int i = 0; i < 2; i++) {
         if (vkCreateImage(V.dev, &ic, NULL, &fg->out[i]) != VK_SUCCESS) return false;
@@ -193,13 +193,17 @@ static bool create_flip_chain(framegen_t *fg, VkExtent2D ext) {
     return true;
 }
 
-// Barrier helper: layout transition for a VkImage (Vulkan 1.2+ style with memory barrier)
-static void fg_bar(VkCommandBuffer cb, VkImage img, VkImageLayout old, VkImageLayout new_) {
+// Barrier helper: layout transition for a VkImage with explicit stages/access.
+// srcStage/dstStage: the pipeline stages that read/write during the old/new layouts.
+// For compute reads: COMPUTE_SHADER; for transfer reads: TRANSFER; for shader writes: COMPUTE_SHADER.
+static void fg_bar(VkCommandBuffer cb, VkImage img, VkImageLayout old, VkImageLayout new_,
+                   VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                   VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
     VkImageMemoryBarrier mb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     mb.oldLayout = old; mb.newLayout = new_; mb.image = img;
+    mb.srcAccessMask = srcAccess; mb.dstAccessMask = dstAccess;
     mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; mb.subresourceRange.baseArrayLayer = 0; mb.subresourceRange.layerCount = 1; mb.subresourceRange.baseMipLevel = 0; mb.subresourceRange.levelCount = 1;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &mb);
+    vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &mb);
 }
 
 // Shader module load from loaded .spv bytes (stored in fg->shader_data/len)
@@ -232,7 +236,7 @@ void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
         ic.extent.width = ww; ic.extent.height = wh; ic.extent.depth = 1;
         ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT;
         ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         for (int i = 0; i < 2; i++) {
             VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -246,35 +250,33 @@ void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
 
     uint32_t idx = g_fg_count % 2;  
 
-    // Barrier src → SHADER_READ_ONLY for compute shader sampling (flip reads from swapchain via descriptor set)  
-    fg_bar(cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);  
+    // Barrier src PRESENT_SRC → TRANSFER_SRC_OPTIMAL (read source)
+    fg_bar(cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+           0, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // Barrier flip chain → SHADER_WRITE for compute shader write access  
-    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);  
+    // Barrier flip[idx] UNDEFINED → TRANSFER_DST_OPTIMAL (write destination)
+    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+           0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // Compute dispatch: post-process src → flip_chain output (reads from swapchain via descriptor set)  
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_fg.pipe[idx]);  
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_fg.layout, 0, 1, &g_fg.set[idx], 0, NULL);  
-    uint32_t wg = (ww + 7) / 8; uint32_t wh2 = (wh + 7) / 8;
-    vkCmdDispatch(cb, wg, wh2, 1);  
+    // Copy: src → flip[idx]  
+    VkImageCopy copy = {0};
+    copy.srcSubresource.aspectMask = copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.extent = (VkExtent3D){(uint32_t)ww, (uint32_t)wh, 1};
+    vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_fg.out[idx],
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-    // Barrier flip chain → TRANSFER_SRC for blit to swapchain  
-    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  
+    // Barrier flip TRANSFER_DST → TRANSFER_SRC (read flipped)
+    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // Blit flip chain → swapchain image for presentation  
-    VkImageBlit blit = {0};
-    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;  
-    blit.srcSubresource.baseArrayLayer = 0; blit.srcSubresource.layerCount = 1;
-    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    blit.dstSubresource.baseArrayLayer = 0; blit.dstSubresource.layerCount = 1;
-    blit.srcOffsets[0] = (VkOffset3D){0, 0, 0};  
-    blit.srcOffsets[1] = (VkOffset3D){(int)ww, (int)wh, 1};  
-    blit.dstOffsets[0] = (VkOffset3D){0, 0, 0};
-    blit.dstOffsets[1] = (VkOffset3D){(int)ww, (int)wh, 1};  
-    vkCmdBlitImage(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);  
+    // Copy flip[idx] → src (dest = TRANSFER_DST)
+    vkCmdCopyImage(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-    // Barrier swapchain → PRESENT_SRC_KHR for presentation  
-    fg_bar(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);  
+    // Barrier src → PRESENT_SRC_KHR for presentation  
+    fg_bar(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+           VK_ACCESS_MEMORY_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     g_fg_count++;
 }
