@@ -196,7 +196,9 @@ def _try_dxc_blob(blob_path, out_spv):
     import subprocess
     try:
         result = subprocess.run(
-            ['dxc', '-T', 'ps_5_0', '-E', 'main', str(blob_path), '-O3',
+            # Every blob in Lossless.dll is cs_5_0 (verified: all 202 SHEX version
+            # tokens decode to program type 5, major.minor 5.0).
+            ['dxc', '-T', 'cs_5_0', '-E', 'main', str(blob_path), '-O3',
              '-spirv', '-no_api', '-Fo', str(out_spv)],
             capture_output=True, timeout=30,
         )
