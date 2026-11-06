@@ -214,13 +214,13 @@ static bool load_shader(VkDevice dev, const uint8_t *data, size_t len, VkShaderM
 }
 
 void framegen_init(void) {
-    uint8_t *shader = NULL; size_t len = 0;
-    shader = load_lsfg_shader("/sdcard/Android/data/", &len);
-    if (!shader) return;
-    free(shader);
-    // TODO: pipelines, descriptor pool/sets and the flip chain are not created yet.
-    // Stay inactive (no-op) until they exist; marking active now would bind null pipelines.
-    g_fg.active = 0;
+    if (getenv("DM_FRAMEGEN") && atoi(getenv("DM_FRAMEGEN"))) {
+        VKLOG("framegen: stage 1 copy pass on");
+        g_fg.active = 1;
+    } else {
+        VKLOG("framegen: stage 1 copy pass off");
+        g_fg.active = 0;
+    }
 }
 
 void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
@@ -231,13 +231,6 @@ void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
             if (g_fg.out[i]) vkDestroyImageView(V.dev, g_fg.out_view[i], NULL),
                 vkDestroyImage(V.dev, g_fg.out[i], NULL), vkFreeMemory(V.dev, g_fg.out_mem[i], NULL);
         }
-        VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ic.imageType = VK_IMAGE_TYPE_2D; ic.format = VK_FORMAT_R8G8B8A8_UNORM;
-        ic.extent.width = ww; ic.extent.height = wh; ic.extent.depth = 1;
-        ic.mipLevels = 1; ic.arrayLayers = 1; ic.samples = VK_SAMPLE_COUNT_1_BIT;
-        ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         for (int i = 0; i < 2; i++) {
             VkDeviceMemory mem = VK_NULL_HANDLE;
             VkImage img = create_flip_image(V.dev, ext, &mem);
@@ -258,7 +251,7 @@ void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
     fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
            0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    // Copy: src → flip[idx]  
+    // Copy: src → flip[idx]  (src = TRANSFER_SRC, flip = TRANSFER_DST)
     VkImageCopy copy = {0};
     copy.srcSubresource.aspectMask = copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.extent = (VkExtent3D){(uint32_t)ww, (uint32_t)wh, 1};
@@ -268,6 +261,11 @@ void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
     // Barrier flip TRANSFER_DST → TRANSFER_SRC (read flipped)
     fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
            VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    // Barrier src TRANSFER_SRC → TRANSFER_DST (it was TRANSFER_SRC after copy; needs DST for write-back)
+    fg_bar(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+           VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
     // Copy flip[idx] → src (dest = TRANSFER_DST)
