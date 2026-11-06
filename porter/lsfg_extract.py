@@ -48,6 +48,62 @@ def _find_dxbc_blob(data, start=0):
     return idx if idx >= 0 else None
 
 
+_PROGRAM_TYPE_STAGE = {
+    0: 'ps',   # pixel shader
+    1: 'vs',   # vertex shader
+    2: 'gs',   # geometry shader
+    3: 'hs',   # hull shader
+    4: 'ds',   # domain shader
+    5: 'cs',   # compute shader
+}
+
+
+def _read_shader_stage(blob: bytes, chunk_offsets: list[int]) -> str:
+    """Locate the SHEX chunk in *blob* and decode its program type.
+
+    Returns one of 'ps', 'vs', 'gs', 'hs', 'ds', 'cs' (lowercase stage name).
+    Raises ValueError when no SHEX chunk or a non-standard token is found.
+
+    Known DXBC container layout:
+        +0x00: magic "DXBC"       (4 bytes)
+        +0x04–0x13: 16-byte checksum
+        +0x14: uint32 one (always 1)
+        +0x18: uint32 totalSize
+        +0x1C: uint32 chunkCount
+        +0x20 onward: chunkCount × uint32, each an offset relative to container start.
+    Each chunk: 4-byte tag then uint32 size then data.
+
+    SHEX version token (first uint32 of its data):
+        bits 16-23 = program type  (0=ps … 5=cs)
+        bits 0-3   = minor version, bits 4-7 = major version.
+    """
+    # DXBC header guarantees chunk list at offset +0x20
+    if len(blob) < 0x20 + 4:
+        raise ValueError('blob too short for chunk offsets')
+
+    chunk_count = _read_u32_le(blob, 0x1C)
+    off_20 = 0x20
+
+    for i in range(chunk_count):
+        cpos = _read_u32_le(blob, off_20 + i * 4)
+
+        # Read chunk tag (first 4 bytes of chunk data)
+        if cpos + 4 > len(blob):
+            continue
+        tag = blob[cpos:cpos + 4]
+        if tag == b'SHEX':
+            token_off = cpos + 8   # skip tag(4) + size(4), first uint32 is the token
+            if token_off + 4 <= len(blob):
+                token = _read_u32_le(blob, token_off)
+                prog_type = (token >> 16) & 0xFF
+                stage = _PROGRAM_TYPE_STAGE.get(prog_type)
+                if stage is not None:
+                    return stage
+            raise ValueError(f'SHEX found but token or program type invalid (token=0x{token:08X})')
+
+    raise ValueError('no SHEX chunk found')
+
+
 def _parse_string_table(data, hdr_off):
     """Parse the DXBC string table header. Returns {name: value} pairs."""
     if hdr_off < 0 or hdr_off + 8 > len(data):
@@ -104,14 +160,16 @@ def extract_dll(dll_path, out_dir=None, force=False):
         strings = _parse_string_table(blob, off + 8)
         name = next(iter(strings.keys()), f'shad_{checksum[:8]}') if strings else f'shad_{checksum[:8]}'
 
-        version = ''
-        for s in strings:
-            if s.startswith(('vs_', 'ps_', 'gs_', 'hs_', 'ds_', 'cs_')):
-                version = s
-                break
+        # Profile: read from real SHEX chunk instead of broken string-table guess
+        profile = ''
+        try:
+            profile = _read_shader_stage(blob, [])
+        except ValueError:
+            pass  # leave profile as empty string for unknown blobs
 
         blobs.append(DxbcInfo(name=name, size=hdr_size, offset=off,
-                              checksum=checksum, version=version))
+                              checksum=checksum, version='',
+                              profile=profile))
         off = end
 
     if not blobs:
