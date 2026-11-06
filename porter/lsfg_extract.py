@@ -85,7 +85,9 @@ def extract_dll(dll_path, out_dir=None, force=False):
     off = 0
 
     while (off := _find_dxbc_blob(dll_bytes, off)) is not None:
-        hdr_size = _read_u32_le(dll_bytes, off + 8)
+        # Standard DXBC container layout: magic(4) + checksum(16) + one(4) + totalSize(4) at +0x18.
+        # +8 is inside the checksum, not a size field.
+        hdr_size = _read_u32_le(dll_bytes, off + 0x18)
 
         if hdr_size < 0x1C or hdr_size > 64 << 20:
             off += 1
