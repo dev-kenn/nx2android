@@ -26,3 +26,7 @@ title.keys
 
 # The player bundle (python packaging/build_bundle.py)
 /dist/
+
+# Frame generation: user-supplied DLL and extracted shader data (never commit, always git-ignored)
+Lossless.dll
+*.lsfgpack
