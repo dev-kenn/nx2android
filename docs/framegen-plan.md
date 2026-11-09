@@ -1,7 +1,7 @@
 # Frame Generation Plan (LSFG-style)
 
 **Branch:** `feat/framegen-lsfg`  
-**Status:** Phase 2 under way. Done: extractor (202 DXBC blobs, stage detection), CLI/pipeline flags, flip-chain copy pass at stage 1. Not done: DXBC to SPIR-V, dispatch sequence, compute passes.  
+**Status:** Phase 2 under way. Done: extractor (202 DXBC blobs, stage detection), CLI/pipeline flags, stage 2: compute pass with frame history (test blend shader, not yet on a device). Not done: DXBC to SPIR-V, dispatch sequence, compute passes.  
 **User DLL:** `Lossless.dll` in the repo root (git-ignored, never committed)
 
 ---

@@ -1,0 +1,13 @@
+#version 450
+// Frame generation, stage 2 test shader (framegen_vk.c): out = mix(prev, cur, t) per texel. A stand-in for the Lossless.dll compute shaders: it proves the
+// compute pipeline, the three storage images, the frame history and the barriers before the real shaders go in. t = 1 is an exact copy of the current frame.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D cur;
+layout(set = 0, binding = 1, rgba8) uniform readonly image2D prev;
+layout(set = 0, binding = 2, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { float t; } p;
+void main() {
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(xy, imageSize(dst)))) return;
+    imageStore(dst, xy, mix(imageLoad(prev, xy), imageLoad(cur, xy), p.t));
+}

@@ -1,269 +1,182 @@
-// Android port, Vulkan backend: LSFG-style frame generation (framegen_vk.c).
-// Optional post-process module: reads the game's final composited frame and produces
-// an intermediate frame using the user-supplied shaders from Lossless.dll.
-//
-// Flip chain architecture:
-//   - Two flip chain images act as back/front buffers for intermediate storage
-//   - One compute dispatch per frame: read src, post-process to flip_chain, blit to swapchain
-//   - Fence-based sync prevents GPU-ahead-of-CPU collisions (max_in_flight <= 2)
+// Android port, Vulkan backend: LSFG-style frame generation (framegen_vk.c), stage 2.
+// Per present: src (swapchain image) -> cur; compute(cur, prev) -> out; out -> src; cur -> prev.
+// cur, prev and out are storage images that stay in GENERAL between frames. The compute shader is a test
+// blend (shaders/framegen_blend.comp) standing in for the Lossless.dll shaders.
 
 #include "framegen_vk.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
+#include "framegen_blend_comp.spv.h"
 
-static framegen_t g_fg = {0};
+enum { IMG_CUR, IMG_PREV, IMG_OUT, NIMG };
+#define FG_FMT VK_FORMAT_R8G8B8A8_UNORM
+
+static struct {
+    int active;            // DM_FRAMEGEN=1
+    int failed;            // resource creation failed: stay off until the swapchain is recreated
+    float mix;             // DM_FRAMEGEN_MIX
+    int have_prev;         // prev holds a real frame
+    VkExtent2D ext;        // extent the images were made for
+    VkImage img[NIMG];
+    VkDeviceMemory mem[NIMG];
+    VkImageView view[NIMG];
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    VkDescriptorPool pool;
+    VkDescriptorSet set;
+} g_fg;
 static uint64_t g_fg_count;
 
-// ---- Helpers ----
-
-static VkImage create_image(VkDevice dev, VkExtent2D ext, VkFormat fmt,
-                            VkImageUsageFlags usage, VkMemoryPropertyFlags props) {
-    VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ic.imageType = VK_IMAGE_TYPE_2D;
-    ic.format = fmt;
-    ic.extent.width = ext.width;
-    ic.extent.height = ext.height;
-    ic.extent.depth = 1;
-    ic.mipLevels = 1;
-    ic.arrayLayers = 1;
-    ic.samples = VK_SAMPLE_COUNT_1_BIT;
-    ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = usage;
-    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImage img;
-    if (vkCreateImage(dev, &ic, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkMemoryRequirements rq;
-    vkGetImageMemoryRequirements(dev, img, &rq);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = rq.size;
-    ai.memoryTypeIndex = 0;
-    ai.memoryTypeIndex = vk_mem_type(rq.memoryTypeBits, props, 0);
-    if (ai.memoryTypeIndex == UINT32_MAX) { vkDestroyImage(dev, img, NULL); return VK_NULL_HANDLE; }
-    VkDeviceMemory mem;
-    if (vkAllocateMemory(dev, &ai, NULL, &mem) != VK_SUCCESS) {
-        vkDestroyImage(dev, img, NULL); return VK_NULL_HANDLE;
+static void fg_free_images(void) {
+    for (int i = 0; i < NIMG; i++) {
+        if (g_fg.view[i]) vkDestroyImageView(V.dev, g_fg.view[i], NULL);
+        if (g_fg.img[i]) vkDestroyImage(V.dev, g_fg.img[i], NULL);
+        if (g_fg.mem[i]) vkFreeMemory(V.dev, g_fg.mem[i], NULL);
+        g_fg.view[i] = VK_NULL_HANDLE; g_fg.img[i] = VK_NULL_HANDLE; g_fg.mem[i] = VK_NULL_HANDLE;
     }
-    if (vkBindImageMemory(dev, img, mem, 0) != VK_SUCCESS) {
-        vkFreeMemory(dev, mem, NULL); vkDestroyImage(dev, img, NULL);
-        return VK_NULL_HANDLE;
-    }
-    return img;
+    g_fg.have_prev = 0;
 }
 
-static VkImageView create_view(VkDevice dev, VkImage img, VkFormat fmt) {
-    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = img;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = fmt;
-    vi.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-    vi.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-    vi.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-    vi.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    vi.subresourceRange.baseMipLevel = 0;
-    vi.subresourceRange.levelCount = 1;
-    vi.subresourceRange.baseArrayLayer = 0;
-    vi.subresourceRange.layerCount = 1;
-    VkImageView view;
-    return vkCreateImageView(dev, &vi, NULL, &view) == VK_SUCCESS ? view : VK_NULL_HANDLE;
+static void fg_free_all(void) {
+    if (!V.dev) return;
+    vkDeviceWaitIdle(V.dev);
+    fg_free_images();
+    if (g_fg.pool) vkDestroyDescriptorPool(V.dev, g_fg.pool, NULL);
+    if (g_fg.pipe) vkDestroyPipeline(V.dev, g_fg.pipe, NULL);
+    if (g_fg.layout) vkDestroyPipelineLayout(V.dev, g_fg.layout, NULL);
+    if (g_fg.dsl) vkDestroyDescriptorSetLayout(V.dev, g_fg.dsl, NULL);
+    g_fg.pool = VK_NULL_HANDLE; g_fg.pipe = VK_NULL_HANDLE; g_fg.layout = VK_NULL_HANDLE; g_fg.dsl = VK_NULL_HANDLE;
+    g_fg.set = VK_NULL_HANDLE; g_fg.ext = (VkExtent2D){0, 0};
 }
 
-// ---- Flip chain setup (chunk 1) ----
-
-// Create a storage image for the flip chain: optimal tiling, color aspect, transfer-compute usage
-static VkImage create_flip_image(VkDevice dev, VkExtent2D ext, VkDeviceMemory *out_mem) {
-    VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ic.imageType = VK_IMAGE_TYPE_2D;
-    ic.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ic.extent.width = ext.width; ic.extent.height = ext.height; ic.extent.depth = 1;
-    ic.mipLevels = 1; ic.arrayLayers = 1;
-    ic.samples = VK_SAMPLE_COUNT_1_BIT;
-    ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImage img;
-    if (vkCreateImage(dev, &ic, NULL, &img) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkMemoryRequirements rq; vkGetImageMemoryRequirements(dev, img, &rq);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = rq.size; ai.memoryTypeIndex = 0;
-    ai.memoryTypeIndex = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    if (ai.memoryTypeIndex == UINT32_MAX) { vkDestroyImage(dev, img, NULL); return VK_NULL_HANDLE; }
-    VkDeviceMemory mem;
-    if (vkAllocateMemory(dev, &ai, NULL, &mem) != VK_SUCCESS) {
-        vkDestroyImage(dev, img, NULL); return VK_NULL_HANDLE;
-    }
-    if (vkBindImageMemory(dev, img, mem, 0) != VK_SUCCESS) {
-        vkFreeMemory(dev, mem, NULL); vkDestroyImage(dev, img, NULL); return VK_NULL_HANDLE;
-    }
-    *out_mem = mem; return img;
-}
-
-// ---- Descriptor set layout + pipeline layout (chunk 2) ----
-
-static void framegen_reset(framegen_t *fg) {
-    for (int i = 0; i < 2; i++) {
-        if (fg->out[i]) { vkDestroyImageView(V.dev, fg->out_view[i], NULL); vkDestroyImage(V.dev, fg->out[i], NULL); if (fg->out_mem[i]) vkFreeMemory(V.dev, fg->out_mem[i], NULL), fg->out_mem[i] = VK_NULL_HANDLE; fg->out[i] = VK_NULL_HANDLE; }
-        fg->out_view[i] = VK_NULL_HANDLE;
-    }
-    fg->dsl = VK_NULL_HANDLE; fg->layout = VK_NULL_HANDLE;
-    if (fg->pool) vkResetDescriptorPool(V.dev, fg->pool, 0);
-    fg->samp = VK_NULL_HANDLE; fg->pipe[0] = VK_NULL_HANDLE; fg->pipe[1] = VK_NULL_HANDLE;
-    fg->fences[0] = VK_NULL_HANDLE; fg->fences[1] = VK_NULL_HANDLE; fg->fences[2] = VK_NULL_HANDLE; fg->fences[3] = VK_NULL_HANDLE;
-}
-
-static bool make_layouts(framegen_t *fg) {
-    // Descriptor set layout: 1 combined image sampler at binding 0
-    VkDescriptorSetLayoutBinding b = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
-    VkDescriptorSetLayoutCreateInfo li = (VkDescriptorSetLayoutCreateInfo){VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
-    return vkCreateDescriptorSetLayout(V.dev, &li, NULL, &fg->dsl) == VK_SUCCESS;
-}
-
-static bool make_pipeline_layout(framegen_t *fg) {
-    VkPushConstantRange pr = (VkPushConstantRange){VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 4}; // ext.w, ext.h, pad, pad
-    VkPipelineLayoutCreateInfo pli = (VkPipelineLayoutCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &fg->dsl, 1, &pr};
-    return vkCreatePipelineLayout(V.dev, &pli, NULL, &fg->layout) == VK_SUCCESS;
-}
-
-static bool make_sampler(framegen_t *fg) {
-    VkSamplerCreateInfo si = (VkSamplerCreateInfo){VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    si.magFilter = VK_FILTER_LINEAR; si.minFilter = VK_FILTER_LINEAR;
-    si.maxAnisotropy = 1.0f; si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    return vkCreateSampler(V.dev, &si, NULL, &fg->samp) == VK_SUCCESS;
-}
-
-// ---- Flip chain images + views (chunk 3) ----
-
-static bool create_flip_chain(framegen_t *fg, VkExtent2D ext) {
-    VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ic.imageType = VK_IMAGE_TYPE_2D; ic.format = VK_FORMAT_R8G8B8A8_UNORM;
-    ic.extent.width = ext.width; ic.extent.height = ext.height; ic.extent.depth = 1; ic.mipLevels = 1; ic.arrayLayers = 1;
-    ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    for (int i = 0; i < 2; i++) {
-        if (vkCreateImage(V.dev, &ic, NULL, &fg->out[i]) != VK_SUCCESS) return false;
-        VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, fg->out[i], &rq);
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = rq.size; ai.memoryTypeIndex = 0;
-        ai.memoryTypeIndex = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-        if (ai.memoryTypeIndex == UINT32_MAX) return false;
-        if (vkAllocateMemory(V.dev, &ai, NULL, &fg->out_mem[i]) != VK_SUCCESS) return false;
-        if (vkBindImageMemory(V.dev, fg->out[i], fg->out_mem[i], 0) != VK_SUCCESS) return false;
-        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = fg->out[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(V.dev, &vi, NULL, &fg->out_view[i]) != VK_SUCCESS) return false;
-    }
-    return true;
-}
-
-// Barrier helper: layout transition for a VkImage with explicit stages/access.
-// srcStage/dstStage: the pipeline stages that read/write during the old/new layouts.
-// For compute reads: COMPUTE_SHADER; for transfer reads: TRANSFER; for shader writes: COMPUTE_SHADER.
-static void fg_bar(VkCommandBuffer cb, VkImage img, VkImageLayout old, VkImageLayout new_,
-                   VkAccessFlags srcAccess, VkAccessFlags dstAccess,
-                   VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
-    VkImageMemoryBarrier mb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    mb.oldLayout = old; mb.newLayout = new_; mb.image = img;
-    mb.srcAccessMask = srcAccess; mb.dstAccessMask = dstAccess;
-    mb.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; mb.subresourceRange.baseArrayLayer = 0; mb.subresourceRange.layerCount = 1; mb.subresourceRange.baseMipLevel = 0; mb.subresourceRange.levelCount = 1;
-    vkCmdPipelineBarrier(cb, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &mb);
-}
-
-// Shader module load from loaded .spv bytes (stored in fg->shader_data/len)
-static bool load_shader(VkDevice dev, const uint8_t *data, size_t len, VkShaderModule *out) {
+// Pipeline, layouts and descriptor set: made once (the set's three bindings are rewritten when the images change).
+static int fg_make_pipeline(void) {
+    VkDescriptorSetLayoutBinding b[NIMG];
+    for (int i = 0; i < NIMG; i++) b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL};
+    VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = NIMG; li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_fg.dsl) != VK_SUCCESS) return 0;
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float)};
+    VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1; pl.pSetLayouts = &g_fg.dsl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(V.dev, &pl, NULL, &g_fg.layout) != VK_SUCCESS) return 0;
     VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    sm.codeSize = len; sm.pCode = (const uint32_t *)data;
-    return vkCreateShaderModule(dev, &sm, NULL, out) == VK_SUCCESS;
+    sm.codeSize = sizeof framegen_blend_comp_spv; sm.pCode = framegen_blend_comp_spv;
+    VkShaderModule mod;
+    if (vkCreateShaderModule(V.dev, &sm, NULL, &mod) != VK_SUCCESS) return 0;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = mod; ci.stage.pName = "main";
+    ci.layout = g_fg.layout;
+    VkResult r = vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &g_fg.pipe);
+    vkDestroyShaderModule(V.dev, mod, NULL);
+    if (r != VK_SUCCESS) return 0;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, NIMG};
+    VkDescriptorPoolCreateInfo pc = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pc.maxSets = 1; pc.poolSizeCount = 1; pc.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(V.dev, &pc, NULL, &g_fg.pool) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_fg.pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &g_fg.dsl;
+    return vkAllocateDescriptorSets(V.dev, &ai, &g_fg.set) == VK_SUCCESS;
+}
+
+static int fg_make_images(VkExtent2D ext) {
+    for (int i = 0; i < NIMG; i++) {
+        VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ic.imageType = VK_IMAGE_TYPE_2D; ic.format = FG_FMT;
+        ic.extent = (VkExtent3D){ext.width, ext.height, 1}; ic.mipLevels = 1; ic.arrayLayers = 1;
+        ic.samples = VK_SAMPLE_COUNT_1_BIT; ic.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ic.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(V.dev, &ic, NULL, &g_fg.img[i]) != VK_SUCCESS) return 0;
+        VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, g_fg.img[i], &rq);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = rq.size;
+        ai.memoryTypeIndex = vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+        if (ai.memoryTypeIndex == UINT32_MAX) return 0;
+        if (vkAllocateMemory(V.dev, &ai, NULL, &g_fg.mem[i]) != VK_SUCCESS) return 0;
+        if (vkBindImageMemory(V.dev, g_fg.img[i], g_fg.mem[i], 0) != VK_SUCCESS) return 0;
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = g_fg.img[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = FG_FMT;
+        vi.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(V.dev, &vi, NULL, &g_fg.view[i]) != VK_SUCCESS) return 0;
+    }
+    VkDescriptorImageInfo di[NIMG]; VkWriteDescriptorSet w[NIMG];
+    for (int i = 0; i < NIMG; i++) {
+        di[i] = (VkDescriptorImageInfo){VK_NULL_HANDLE, g_fg.view[i], VK_IMAGE_LAYOUT_GENERAL};
+        w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = g_fg.set; w[i].dstBinding = i; w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[i].pImageInfo = &di[i];
+    }
+    vkUpdateDescriptorSets(V.dev, NIMG, w, 0, NULL);
+    return 1;
+}
+
+static void fg_bar(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                   VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+    VkImageMemoryBarrier mb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    mb.srcAccessMask = sa; mb.dstAccessMask = da; mb.oldLayout = from; mb.newLayout = to;
+    mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; mb.image = img;
+    mb.subresourceRange = (VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cb, ss, ds, 0, 0, NULL, 0, NULL, 1, &mb);
 }
 
 void framegen_init(void) {
-    if (getenv("DM_FRAMEGEN") && atoi(getenv("DM_FRAMEGEN"))) {
-        VKLOG("framegen: stage 1 copy pass on");
-        g_fg.active = 1;
-    } else {
-        VKLOG("framegen: stage 1 copy pass off");
-        g_fg.active = 0;
-    }
+    const char *e = getenv("DM_FRAMEGEN"), *m = getenv("DM_FRAMEGEN_MIX");
+    g_fg.active = e && atoi(e);
+    g_fg.failed = 0;
+    g_fg.mix = m ? (float)atof(m) : 1.0f;
+    if (g_fg.mix < 0) g_fg.mix = 0;
+    if (g_fg.mix > 1) g_fg.mix = 1;
+    VKLOG("framegen: stage 2 compute blend %s (mix %.2f)", g_fg.active ? "on" : "off", g_fg.mix);
 }
 
 void framegen_submit(VkCommandBuffer cb, VkImage src, VkExtent2D ext) {
-    if (!g_fg.active) return;  
-    uint32_t ww = ext.width, wh = ext.height;
-    if (g_fg.out[0] == VK_NULL_HANDLE || g_fg.ext.width != ww || g_fg.ext.height != wh) {
-        for (int i = 0; i < 2; i++) {
-            if (g_fg.out[i]) vkDestroyImageView(V.dev, g_fg.out_view[i], NULL),
-                vkDestroyImage(V.dev, g_fg.out[i], NULL), vkFreeMemory(V.dev, g_fg.out_mem[i], NULL);
-        }
-        for (int i = 0; i < 2; i++) {
-            VkDeviceMemory mem = VK_NULL_HANDLE;
-            VkImage img = create_flip_image(V.dev, ext, &mem);
-            if (!img) return;
-            g_fg.out[i] = img; g_fg.out_mem[i] = mem;
-            g_fg.out_view[i] = create_view(V.dev, img, VK_FORMAT_R8G8B8A8_UNORM);
-        }
+    if (!g_fg.active || g_fg.failed || !ext.width || !ext.height) return;
+    if (!g_fg.pipe && !fg_make_pipeline()) { VKLOG("framegen: pipeline creation failed, off"); fg_free_all(); g_fg.failed = 1; return; }
+    if (g_fg.ext.width != ext.width || g_fg.ext.height != ext.height) {
+        vkDeviceWaitIdle(V.dev);
+        fg_free_images();
+        if (!fg_make_images(ext)) { VKLOG("framegen: image creation failed, off"); fg_free_images(); g_fg.failed = 1; return; }
         g_fg.ext = ext;
-    }  
+    }
+    VkImage cur = g_fg.img[IMG_CUR], prev = g_fg.img[IMG_PREV], out = g_fg.img[IMG_OUT];
+    const VkPipelineStageFlags T = VK_PIPELINE_STAGE_TRANSFER_BIT, C = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, A = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkImageLayout GEN = VK_IMAGE_LAYOUT_GENERAL, TS = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, TD = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, UN = VK_IMAGE_LAYOUT_UNDEFINED;
+    const VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {ext.width, ext.height, 1}};
+    int first = !g_fg.have_prev;
 
-    uint32_t idx = g_fg_count % 2;  
+    // src -> cur
+    fg_bar(cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, TS, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, A, T);
+    fg_bar(cb, cur, UN, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, A, T);
+    vkCmdCopyImage(cb, src, TS, cur, TD, 1, &cp);
 
-    // Barrier src PRESENT_SRC → TRANSFER_SRC_OPTIMAL (read source)
-    fg_bar(cb, src, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-           0, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // compute: (cur, prev) -> out. prev and out are in GENERAL after the first frame; the first frame moves them out of UNDEFINED.
+    fg_bar(cb, cur, TD, GEN, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, T, C);
+    fg_bar(cb, prev, first ? UN : GEN, GEN, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, A, C);
+    fg_bar(cb, out, UN, GEN, 0, VK_ACCESS_SHADER_WRITE_BIT, A, C);
+    float t = first ? 1.0f : g_fg.mix;   // no previous frame yet: pass the current one through
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_fg.pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_fg.layout, 0, 1, &g_fg.set, 0, NULL);
+    vkCmdPushConstants(cb, g_fg.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof t, &t);
+    vkCmdDispatch(cb, (ext.width + 7) / 8, (ext.height + 7) / 8, 1);
 
-    // Barrier flip[idx] UNDEFINED → TRANSFER_DST_OPTIMAL (write destination)
-    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-           0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    // out -> src, and cur -> prev for the next frame
+    fg_bar(cb, out, GEN, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, C, T);
+    fg_bar(cb, src, TS, TD, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, T, T);
+    vkCmdCopyImage(cb, out, TS, src, TD, 1, &cp);
+    fg_bar(cb, cur, GEN, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, C, T);
+    fg_bar(cb, prev, GEN, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, C, T);
+    vkCmdCopyImage(cb, cur, TS, prev, TD, 1, &cp);
+    fg_bar(cb, prev, TD, GEN, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, T, C);   // the next frame's compute reads it
+    fg_bar(cb, src, TD, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, T, A);
 
-    // Copy: src → flip[idx]  (src = TRANSFER_SRC, flip = TRANSFER_DST)
-    VkImageCopy copy = {0};
-    copy.srcSubresource.aspectMask = copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.extent = (VkExtent3D){(uint32_t)ww, (uint32_t)wh, 1};
-    vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_fg.out[idx],
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    // Barrier flip TRANSFER_DST → TRANSFER_SRC (read flipped)
-    fg_bar(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-           VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
-           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    // Barrier src TRANSFER_SRC → TRANSFER_DST (it was TRANSFER_SRC after copy; needs DST for write-back)
-    fg_bar(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-           VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
-           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    // Copy flip[idx] → src (dest = TRANSFER_DST)
-    vkCmdCopyImage(cb, g_fg.out[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    // Barrier src → PRESENT_SRC_KHR for presentation  
-    fg_bar(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-           VK_ACCESS_MEMORY_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
+    g_fg.have_prev = 1;
     g_fg_count++;
 }
 
-void framegen_destroy(void) {
-    if (!g_fg.initialized) return;  
-    for (int i = 0; i < 2; i++) {
-        if (g_fg.out[i]) vkDestroyImageView(V.dev, g_fg.out_view[i], NULL),
-            vkDestroyImage(V.dev, g_fg.out[i], NULL), vkFreeMemory(V.dev, g_fg.out_mem[i], NULL);
-    }
-    for (int i = 0; i < 4; i++) { if (g_fg.fences[i]) vkDestroyFence(V.dev, g_fg.fences[i], NULL); }
-    if (g_fg.samp) vkDestroySampler(V.dev, g_fg.samp, NULL);
-    if (g_fg.pool) vkDestroyDescriptorPool(V.dev, g_fg.pool, NULL);
-    if (g_fg.dsl) vkDestroyDescriptorSetLayout(V.dev, g_fg.dsl, NULL);
-    if (g_fg.layout) vkDestroyPipelineLayout(V.dev, g_fg.layout, NULL);
-    for (int i = 0; i < 2; i++) { if (g_fg.pipe[i]) vkDestroyPipeline(V.dev, g_fg.pipe[i], NULL); }
-    g_fg.active = 0; g_fg.initialized = 0;
-}
+void framegen_destroy(void) { fg_free_all(); g_fg.active = 0; }
 
-uint64_t framegen_frame_count(void) { return g_fg_count; }  
-
-void framegen_set_num_swapchain(uint32_t n) {
-    if (n > 1) g_fg.num_swapchain = n; else g_fg.num_swapchain = 2;
-}
+uint64_t framegen_frame_count(void) { return g_fg_count; }
