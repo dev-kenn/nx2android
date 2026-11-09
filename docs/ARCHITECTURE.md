@@ -158,9 +158,9 @@ The engine is our own fork since 2026-10-29: no subtree pull from upstream, and 
 
 | Stage | Where | What |
 |---|---|---|
-| **Extraction** | `porter lsfg-extract <dll>` on the host | Reads Lossless.dll, finds DXBC shader blobs, writes `.lsfgpack` bundle (metadata.json + shaders/*.dxbc). Transpilation to SPIR-V requires `dxc` or `dxcompiler`. |
+| **Extraction** | `porter lsfg-extract <dll>` on the host | Reads Lossless.dll, finds the 202 DXBC compute-shader blobs, writes `.lsfgpack` bundle (metadata.json + shaders/*.dxbc). DXBC to SPIR-V is a separate optional step (`vkd3d-compiler`; dxc cannot read compiled DXBC), not done yet. |
 | **Packaging** | `porter port --framegen --lsfg-dll ...` | The .lsfgpack goes into the data pack (`env.txt` gets `DM_FRAMEGEN=1`, `DM_LSFG_PATH`). |
-| **Runtime** | `nxnative/dm/android/framegen_vk.c` | Reads `DM_FRAMEGEN=1` and `DM_LSFG_PATH` at init. Creates a flip chain, applies LSFG post-process in `vk_present()`, blits result to swapchain. No-op when inactive. |
+| **Runtime** | `nxnative/dm/android/framegen_vk.c` | Reads `DM_FRAMEGEN=1` and `DM_LSFG_PATH` at init. Creates a flip chain and, so far, runs only a copy pass (src to flip to src) in `vk_present()`; the LSFG compute shaders are not wired in yet. No-op when inactive. |
 
 ### Integration points
 

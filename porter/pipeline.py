@@ -603,8 +603,8 @@ class Port:
                 self.lsfg_env = []; self.lsfg_files = {}
                 return
             
-            self.lsfg_env = [f'DM_FRAMEGEN=1', f'DM_LSFG_PATH={datapack.files_folder(self.package)}/lsfg/']
-            self.lsfg_files = {f'lsfg/{b.checksum[:8]}.dxbc': out_dir / 'shaders' / f'{b.checksum}.dxbc' for b in blobs[:64]}
+            self.lsfg_env = ['DM_FRAMEGEN=1', f'DM_LSFG_PATH={datapack.files_folder(self.package)}/lsfg/']
+            self.lsfg_files = {f'lsfg/{b.checksum}.dxbc': out_dir / 'shaders' / f'{b.checksum}.dxbc' for b in blobs}
             say(f'[lsfg] done: {len(blobs)} blob(s), {len(self.lsfg_files)} file(s) packed')
         except Exception as e:
             say(f'[RED] --framegen: extraction failed ({e}): frame generation disabled, port continues')

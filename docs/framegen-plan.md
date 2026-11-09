@@ -1,8 +1,8 @@
 # Frame Generation Plan (LSFG-style)
 
 **Branch:** `feat/framegen-lsfg`  
-**Status:** Phase 1 — Research complete. Awaiting "go".  
-**User DLL:** `Lossless.dll` in the project root directory (never committed)
+**Status:** Phase 2 under way. Done: extractor (202 DXBC blobs, stage detection), CLI/pipeline flags, flip-chain copy pass at stage 1. Not done: DXBC to SPIR-V, dispatch sequence, compute passes.  
+**User DLL:** `Lossless.dll` in the repo root (git-ignored, never committed)
 
 ---
 
@@ -34,35 +34,25 @@ vk_present(tex_t *game_tex, double period, int crop[4])
 
 Any framegen resources must be destroyed and recreated alongside the swapchain.
 
-### 1.3 DLL Analysis (Lossless.dll)
+### 1.2 DLL Analysis (Lossless.dll), verified 2026-11-09
 
 | Property | Value |
 |---|---|
-| Format | PE32+ executable (DLL), GUI, x86-64 |
-| Size | 5.4 MB |
-| DXBC blobs found | 202 compiled shader binaries |
-| Shader compiler | Microsoft (R) HLSL Shader Compiler 10.1 |
-| Key strings | `lsfg`, `LSFG2`, `LSFG3` (C++ class names `?.?AVLSFG@@`, etc.) |
+| Format | PE32+ executable (DLL), x86-64 |
+| Size | 7,521,280 bytes |
+| DXBC blobs | 202, all unique, 5,121,772 bytes together |
+| Container | Standard, unobfuscated DXBC (version 1 at +0x14, totalSize at +0x18, chunk table at +0x20) |
+| Stage | Every blob's SHEX version token decodes to program type 5 (compute), SM 5.0 |
 
-**What this means:**
-- All shaders are compiled DXBC (DirectX 11 shader blobs). None are pre-spirv.
-- 202 blobs is substantial — includes the LSFG pipeline, motion estimation, upscaling, and ML inference kernels.
-- The DLL is likely packed/obfuscated (section names were garbled in manual parsing), but DXBC resources appear contiguous in section 4.
+The DLL is **not** packed or obfuscated: the blobs are found by scanning for `DXBC` and checking the container header (`porter/lsfg_extract.py`). The earlier claim of a packed PE with garbled sections was wrong.
 
-**Unverified (TBC):** Without `pefile` or a hex editor, exact blob boundaries cannot be confirmed. The lsfg-vk reference ([PancakeTAS/lsfg-vk](https://github.com/PancakeTAS/lsfg-vk)) shows the extraction approach:
+**DXBC to SPIR-V:** `dxc` cannot read compiled DXBC. The planned tool is `vkd3d-compiler` (vkd3d-shader); it is not installed here and the step is not yet run or verified. What remains unknown, and cannot be read from the bytecode: the dispatch order of the 202 shaders, their resource bindings and how their outputs chain. That needs a GPU capture (RenderDoc or PIX) of Lossless Scaling on Windows.
 
-> Extract DXBC blobs → transpile to GLSL via `dxcompiler` (libshaderc) or `dxc` → compile to SPIR-V. The project maintains a table mapping which shader handles which pipeline stage (input, motion vectors, history buffer management, ML interpolation, output merge).
+### 1.3 Cost Estimate
 
-### 1.5 Cost Estimate
+**Not measured.** No shader has been run on a phone GPU yet, so there is no timing or memory figure. Whether the 202 compute shaders fit a phone's frame budget is the open go/no-go question. It has to be measured on the device (Magenta) once the shaders run. Until then, treat any "feasible" or "infeasible" claim as a guess.
 
-| Metric | Estimate | Notes |
-|---|---|---|
-| **GPU compute for one interpolated frame** | 20–80 ms on Adreno 735 / Apple A16 | ML inference + motion vectors + history buffer management. Depends heavily on resolution and model size. |
-| **Memory: history buffer (3 frames, 1440p, RGBA16F)** | ~256 MB | 3 back+history x 2 channels x 1440x2560 x 4 bytes per float16. |
-| **Added latency** | +1–2 frames | The generated frame itself introduces one additional pipeline stage. |
-| **Feasibility on mobile GPU** | **Likely infeasible for full 3D games** at target resolution | LSFG-style neural frame generation requires ML inference kernels (matrix multiply) that modern Adreno/Mali GPUs support via FP16, but memory bandwidth at 1440p is the bottleneck. May work at 720p/900p with aggressive downscaling. |
-| **Best use case** | 30→60 fps for 2D / menu-driven games | Games whose base frame rate is 30 fps and benefit from interpolation to 60. Simple motion (menus, platformers) interpolates better than complex 3D. |
-| **Fallback** | Present without interpolation (game runs at native frame rate) | If shader pack missing or pipeline creation fails. Log: `[vk] framegen: pack not found, presenting normally`. |
+Known design points: framegen adds at least one frame of latency, and it needs history buffers at the game's resolution (size to be computed from the real shader inputs, not estimated here). If the pack is missing or pipeline creation fails, present normally and log `[vk] framegen: pack not found, presenting normally`.
 
 ### 2. Proposed Architecture
 
@@ -123,9 +113,9 @@ if (g_framegen_on) {
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| DLL packed/obfuscated, DXBC not directly accessible | **High** (section names garbled) | High | May need dynamic instrumentation or a custom PE parser. Try `dxcompiler` on raw bytes. |
+| Dispatch order and bindings of the 202 shaders unknown | **High** | High | Capture Lossless Scaling with RenderDoc or PIX on Windows. |
 | Mobile GPU cannot run LSFG shaders at target resolution | **Likely** (mobile VRAM bandwidth limit) | Medium-High | Graceful fallback: disable silently, log line emitted. Offer lower resolution mode. |
-| Shader extraction tool is complex to build | Medium | Medium | Pre-ship an extraction helper binary (build once on Mac, ship in bundle). Or use Python-based DXBC parser + external dxc call. |
+| DXBC to SPIR-V conversion fails for some shaders | Medium | Medium | Use `vkd3d-compiler`; check every blob converts and passes `spirv-val`. |
 | History buffer memory exceeds device capacity | **Likely** (720p+ games) | Medium | Limit history buffers to 1–2 frames; detect available VRAM; auto-disable if insufficient. |
 | Framegen breaks certain game rendering patterns | Low | Low | Per-game whitelist in android.tsv: `framegen_safe=yes/no`. Off by default anyway. |
 
@@ -133,7 +123,7 @@ if (g_framegen_on) {
 
 | Phase | Effort | Notes |
 |---|---|---|
-| DLL analysis & shader extraction tool | 2–4 days | Most uncertain part. Requires handling packed PE format. |
+| DLL extraction (done) and DXBC to SPIR-V | 1–2 days | Extraction is done; conversion with vkd3d-compiler is pending. |
 | Porter CLI + data pack integration | 0.5 day | Straightforward: add flags, env rows, copy files into pack. |
 | nxnative framegen module (C/Vulkan) | 3–5 days | Post-process pipeline management follows existing patterns (`rot.*` shaders). |
 | Testing & refinement | 2–3 days | Most effort on-device tuning. |
@@ -145,7 +135,7 @@ if (g_framegen_on) {
 porter/
   cli.py                    # + --framegen, --lsfg-dll
   pipeline.py               # + framegen field in Options; call lsfg_extract()
-  lsfg_extract.py           # NEW: extraction tool (reads DLL, calls dxc)
+  lsfg_extract.py           # NEW: extraction tool (reads DLL; optional vkd3d-compiler step)
 
 nxnative/dm/android/
   gfx_vk_present.c          # + DM_FRAMEGEN check; call framegen_present()
@@ -166,7 +156,7 @@ docs/
   ARCHITECTURE.md           # updated: add framegen section
 ```
 
-### 7. Next Steps (Phase 2, only after "go")
+### 7. Steps (1-4 done, 5 started at stage 1; the rest open)
 
 1. **Implement `porter lsfg-extract`** — standalone CLI tool that reads Lossless.dll and extracts shaders to `.gamedump/lsfg/<id>/`.
 2. **Wire up CLI flags** — `--framegen` enables the feature; `--lsfg-dll <path>` provides the DLL path (defaults to `Lossless.dll` in the game folder).

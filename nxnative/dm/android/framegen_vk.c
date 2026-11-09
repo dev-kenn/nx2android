@@ -73,38 +73,6 @@ static VkImageView create_view(VkDevice dev, VkImage img, VkFormat fmt) {
 
 // ---- Flip chain setup (chunk 1) ----
 
-static bool load_lsfg_bytes(const char *path, uint8_t **out, size_t *out_len) {
-    FILE *f = fopen(path, "rb"); if (!f) return false;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return false; }
-    uint8_t *buf = malloc(sz); size_t rd = fread(buf, 1, sz, f); fclose(f);
-    if (rd != (size_t)sz) { free(buf); return false; }
-    *out = buf; *out_len = rd; return true;
-}
-
-static bool lsfg_pack_exists(const char *base) {
-    char path[512];
-    // Check multiple possible locations for the .lsfgpack bundle
-    snprintf(path, sizeof path, "%s/lsfg.spv", base);
-    FILE *f = fopen(path, "rb"); if (f) { fclose(f); return true; }
-    snprintf(path, sizeof path, "%s/lossless_lsfg.spv", base);
-    f = fopen(path, "rb"); if (f) { fclose(f); return true; }
-    snprintf(path, sizeof path, "%s/framegen.spv", base);
-    f = fopen(path, "rb"); if (f) { fclose(f); return true; }
-    return false;
-}
-
-static uint8_t *load_lsfg_shader(const char *base, size_t *out_len) {
-    char path[512];
-    const char *names[] = {"lsfg.spv", "lossless_lsfg.spv", "framegen.spv", NULL};
-    for (int i = 0; names[i]; i++) {
-        snprintf(path, sizeof path, "%s/%s", base, names[i]);
-        uint8_t *data; size_t len;
-        if (load_lsfg_bytes(path, &data, &len)) return data;
-    }
-    return NULL;
-}
-
 // Create a storage image for the flip chain: optimal tiling, color aspect, transfer-compute usage
 static VkImage create_flip_image(VkDevice dev, VkExtent2D ext, VkDeviceMemory *out_mem) {
     VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};

@@ -1,18 +1,17 @@
 # LSFG shader pack extractor for nx2android.
-# Reads a user-supplied Lossless.dll (PE32+, DXBC blobs), extracts raw shader bytes,
-# and produces a .lsfgpack bundle of SPIR-V modules ready for the Android Vulkan runtime.
+# Reads a user-supplied Lossless.dll (PE32+), finds the standard DXBC shader containers
+# embedded in it (plain DXBC: checksum at +4, version 1 at +0x14, totalSize at +0x18, chunk
+# table at +0x20), and writes each one out as a .dxbc file plus a metadata.json.
 #
-# Pipeline: Lossless.dll (DXBC) -> dxldc/DXC transpile -> GLSL(HLSL->GLSL) -> glslc -> SPIR-V -> .lsfgpack
-#
-# This module runs on the host during a port. It does NOT compile or link: only text
-# processing and file I/O. The actual HLSL->GLSL transpilation is delegated to dxc (Microsoft
-# Direct3D Compiler) or dxcompiler when available; without either tool, the extractor still
-# finds DXBC blobs and writes a placeholder .lsfgpack that the runtime can detect but skip.
+# Pipeline: Lossless.dll -> .dxbc blobs -> (vkd3d-shader) -> SPIR-V. The DXBC -> SPIR-V step
+# is optional here and needs the `vkd3d-compiler` CLI; dxc cannot read compiled DXBC.
+# Nothing here compiles or links: only file I/O and the optional external tool.
 #
 # Design decisions:
-# - We parse the PE structure to find DXBC sections rather than rely on any packer/obfuscator,
-#   because Lossless.dll is often obfuscated (section names garbled).
-# - Each DXBC blob becomes one .spv file named by its checksum for easy deduplication.
+# - The blobs are found by scanning for the 'DXBC' magic and validating the container
+#   header, not by parsing PE sections. The DLL is not obfuscated.
+# - Each blob is named by the first 16 hex digits of its SHA-256 (deduplicates identical blobs).
+# - The shader stage comes from the SHEX chunk's version token, never from strings.
 import hashlib
 import json
 import os
@@ -93,38 +92,15 @@ def _read_shader_stage(blob: bytes, chunk_offsets: list[int]) -> str:
         tag = blob[cpos:cpos + 4]
         if tag == b'SHEX':
             token_off = cpos + 8   # skip tag(4) + size(4), first uint32 is the token
-            if token_off + 4 <= len(blob):
-                token = _read_u32_le(blob, token_off)
-                prog_type = (token >> 16) & 0xFF
-                stage = _PROGRAM_TYPE_STAGE.get(prog_type)
-                if stage is not None:
-                    return stage
-            raise ValueError(f'SHEX found but token or program type invalid (token=0x{token:08X})')
+            if token_off + 4 > len(blob):
+                raise ValueError('SHEX chunk truncated')
+            token = _read_u32_le(blob, token_off)
+            stage = _PROGRAM_TYPE_STAGE.get((token >> 16) & 0xFF)
+            if stage is None:
+                raise ValueError(f'SHEX program type invalid (token=0x{token:08X})')
+            return stage
 
     raise ValueError('no SHEX chunk found')
-
-
-def _parse_string_table(data, hdr_off):
-    """Parse the DXBC string table header. Returns {name: value} pairs."""
-    if hdr_off < 0 or hdr_off + 8 > len(data):
-        return {}
-    hdr_size = _read_u32_le(data, hdr_off)
-    str_off = _read_u32_le(data, hdr_off + 4)
-    if hdr_off + str_off + 8 > len(data):
-        return {}
-    end_off = hdr_off + str_off + 8
-    strings = {}
-    off = hdr_off + str_off + 4
-    while off < end_off - 1 and (data[off] != 0 or (off + 1 < end_off and data[off + 1] != 0)):
-        s = b''
-        while off + len(s) < end_off and data[off + len(s)] != 0:
-            s += bytes([data[off + len(s)]])
-            if len(s) > 1024:
-                break
-        if s:
-            strings[s.decode('utf-8', errors='replace')] = ''
-        off += len(s) + 1
-    return strings
 
 
 def extract_dll(dll_path, out_dir=None, force=False):
@@ -136,40 +112,35 @@ def extract_dll(dll_path, out_dir=None, force=False):
     out_dir = Path(out_dir) if out_dir else dll_path.with_suffix('') / 'lsfg'
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    dll_bytes = bytes(dll_path.read_bytes())
+    dll_bytes = dll_path.read_bytes()
     blobs = []
+    seen = set()
     off = 0
 
     while (off := _find_dxbc_blob(dll_bytes, off)) is not None:
-        # Standard DXBC container layout: magic(4) + checksum(16) + one(4) + totalSize(4) at +0x18.
-        # +8 is inside the checksum, not a size field.
-        hdr_size = _read_u32_le(dll_bytes, off + 0x18)
-
-        if hdr_size < 0x1C or hdr_size > 64 << 20:
-            off += 1
-            continue
-
-        end = off + hdr_size
-        if end > len(dll_bytes):
+        # Standard DXBC container: magic(4) + checksum(16) + version(4, =1) + totalSize(4) at
+        # +0x18 + chunkCount(4) at +0x1C + chunkCount offsets from +0x20.
+        if off + 0x20 > len(dll_bytes):
+            break
+        container_version, size, chunk_count = struct.unpack_from('<III', dll_bytes, off + 0x14)
+        end = off + size
+        if (container_version != 1 or chunk_count == 0 or chunk_count > 64
+                or size < 0x20 + 4 * chunk_count or end > len(dll_bytes)):
             off += 1
             continue
 
         blob = dll_bytes[off:end]
         checksum = hashlib.sha256(blob).hexdigest()[:16]
 
-        strings = _parse_string_table(blob, off + 8)
-        name = next(iter(strings.keys()), f'shad_{checksum[:8]}') if strings else f'shad_{checksum[:8]}'
-
-        # Profile: read from real SHEX chunk instead of broken string-table guess
-        profile = ''
         try:
             profile = _read_shader_stage(blob, [])
         except ValueError:
-            pass  # leave profile as empty string for unknown blobs
+            profile = ''   # not a shader container (no SHEX chunk); leave the stage empty
 
-        blobs.append(DxbcInfo(name=name, size=hdr_size, offset=off,
-                              checksum=checksum, version='',
-                              profile=profile))
+        if checksum not in seen:   # identical blobs are written once
+            seen.add(checksum)
+            blobs.append(DxbcInfo(name=f'shad_{checksum[:8]}', size=size, offset=off,
+                                  checksum=checksum, version='', profile=profile))
         off = end
 
     if not blobs:
@@ -191,72 +162,49 @@ def extract_dll(dll_path, out_dir=None, force=False):
     return blobs
 
 
-def _try_dxc_blob(blob_path, out_spv):
-    """Try to transpile a DXBC blob to SPIR-V using the `dxc` CLI."""
+def _try_vkd3d_blob(blob_path, out_spv):
+    """Transpile one compiled DXBC (SM4/5, TPF) blob to SPIR-V with the vkd3d-compiler CLI."""
     import subprocess
     try:
         result = subprocess.run(
-            # Every blob in Lossless.dll is cs_5_0 (verified: all 202 SHEX version
-            # tokens decode to program type 5, major.minor 5.0).
-            ['dxc', '-T', 'cs_5_0', '-E', 'main', str(blob_path), '-O3',
-             '-spirv', '-no_api', '-Fo', str(out_spv)],
-            capture_output=True, timeout=30,
-        )
-        return result.returncode == 0 and out_spv.exists()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def _try_dxcompiler(blob_path, out_spv):
-    """Try to transpile using dxcompiler via dotnet host."""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['dotnet', str(Path(__file__).parent / 'dxcompile_host.dll'),
-             str(blob_path), str(out_spv)],
+            ['vkd3d-compiler', '--source-type=dxbc-tpf', '--target-type=spirv-binary',
+             '-o', str(out_spv), str(blob_path)],
             capture_output=True, timeout=60,
         )
-        return result.returncode == 0 and out_spv.exists()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+    ok = result.returncode == 0 and out_spv.exists()
+    if not ok and out_spv.exists():
+        out_spv.unlink()   # never leave a partial or empty .spv behind
+    return ok
 
 
 def transpile_to_spirv(dxbc_dir, out_dir=None, force=False):
-    """Transpile all DXBC files in dxbc_dir to SPIR-V shaders.
+    """Transpile every .dxbc in dxbc_dir to SPIR-V with vkd3d-compiler.
 
-    Tries dxc first, then dxcompiler. Without either tool, writes stubs.
-    Returns the number of successful transpilations.
+    Returns the number of shaders newly transpiled. Without the tool, or when a shader fails,
+    no .spv is written for it (no placeholder files).
     """
     out_dir = Path(out_dir) if out_dir else dxbc_dir.parent / 'spirv'
-    out_dir.mkdir(parents=True, exist_ok=True)
     spv_dir = out_dir / 'shaders'
-    spv_dir.mkdir(exist_ok=True)
-
-    dxbc_files = list(dxbc_dir.glob('*.dxbc'))
+    dxbc_files = sorted(dxbc_dir.glob('*.dxbc')) if dxbc_dir.is_dir() else []
     if not dxbc_files:
         return 0
+    spv_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'[lsfg] transpile: {len(dxbc_files)} DXBC file(s) to SPIR-V', file=sys.stderr)
-
-    success_count = 0
-    for dxbc_file in sorted(dxbc_files):
+    done = failed = 0
+    for dxbc_file in dxbc_files:
         out_spv = spv_dir / f'{dxbc_file.stem}.spv'
-
         if out_spv.exists() and not force:
             continue
-
-        if _try_dxc_blob(dxbc_file, out_spv):
-            success_count += 1
-            continue
-
-        if _try_dxcompiler(dxbc_file, out_spv):
-            success_count += 1
-            continue
-
-        print(f'[lsfg] stub: {dxbc_file.name} no transpiler found', file=sys.stderr)
-        out_spv.write_bytes(bytes([0x11, 0x00, 0x00, 0x00]))
-
-    return success_count
+        if _try_vkd3d_blob(dxbc_file, out_spv):
+            done += 1
+        else:
+            failed += 1
+    if failed:
+        print(f'[lsfg] {failed} shader(s) not transpiled (vkd3d-compiler missing or failed)', file=sys.stderr)
+    return done
 
 
 def _write_lsfgpack(out_dir, blobs, force=False):
@@ -267,8 +215,8 @@ def _write_lsfgpack(out_dir, blobs, force=False):
         'version': 1,
         'blob_count': len(blobs),
         'blobs': [asdict(b) for b in blobs],
-        'note': 'SPIR-V shaders must be transpiled from DXBC (requires dxc or dxcompiler)',
-        'spirv_ready': False if blobs else True,
+        'note': 'DXBC blobs only; transpile to SPIR-V with vkd3d-compiler (see transpile_to_spirv)',
+        'spirv_ready': False,
     }
     if not meta_path.exists() or force:
         meta_path.write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
