@@ -46,7 +46,7 @@ Any framegen resources must be destroyed and recreated alongside the swapchain.
 
 The DLL is **not** packed or obfuscated: the blobs are found by scanning for `DXBC` and checking the container header (`porter/lsfg_extract.py`). The earlier claim of a packed PE with garbled sections was wrong.
 
-**DXBC to SPIR-V:** `dxc` cannot read compiled DXBC. The planned tool is `vkd3d-compiler` (vkd3d-shader); it is not installed here and the step is not yet run or verified. What remains unknown, and cannot be read from the bytecode: the dispatch order of the 202 shaders, their resource bindings and how their outputs chain. That needs a GPU capture (RenderDoc or PIX) of Lossless Scaling on Windows.
+**DXBC to SPIR-V (verified 2026-11-09):** `dxc` cannot read compiled DXBC, so the porter uses `vkd3d-compiler -x dxbc-tpf -b spirv-binary` (vkd3d-shader, built from source on Windows; set `LSFG_VKD3D_COMPILER` to its path). All 202 blobs convert and all 202 pass `spirv-val --target-env vulkan1.1`. Reflection shows 75 distinct binding signatures: binding 0 is usually a constant buffer, the rest are textures or storage images, all in descriptor set 0. Local sizes: 154 shaders 8x8, 31 16x16, 7 64x1, 6 32x32, 2 128x1, 2 256x1. Still unknown, and not in the bytecode: the dispatch order, what each binding holds and how outputs chain. That needs a GPU capture (RenderDoc or PIX) of Lossless Scaling on Windows.
 
 ### 1.3 Cost Estimate
 

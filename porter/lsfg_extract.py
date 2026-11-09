@@ -167,8 +167,8 @@ def _try_vkd3d_blob(blob_path, out_spv):
     import subprocess
     try:
         result = subprocess.run(
-            ['vkd3d-compiler', '--source-type=dxbc-tpf', '--target-type=spirv-binary',
-             '-o', str(out_spv), str(blob_path)],
+            [os.environ.get('LSFG_VKD3D_COMPILER', 'vkd3d-compiler'), '-x', 'dxbc-tpf',
+             '-b', 'spirv-binary', '-o', str(out_spv), str(blob_path)],
             capture_output=True, timeout=60,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
