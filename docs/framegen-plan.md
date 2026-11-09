@@ -50,7 +50,7 @@ The DLL is **not** packed or obfuscated: the blobs are found by scanning for `DX
 
 ### 1.3 Cost Estimate
 
-**Not measured.** No shader has been run on a phone GPU yet, so there is no timing or memory figure. Whether the 202 compute shaders fit a phone's frame budget is the open go/no-go question. It has to be measured on the device (Magenta) once the shaders run. Until then, treat any "feasible" or "infeasible" claim as a guess.
+**First measurement, 2026-11-09 (Magenta, Adreno 730, driver 512.615.98).** All 202 shaders create pipelines and run (`devtools/lsfg_bench`). Static analysis of the DLL recovered one dispatch list (engine B, `[this+8]`=0 heavy mode: 254, 255, 267-270, then the 257-274 chain, then 256; loop count N=7 assumed from "6 or 7"). Timing each dispatch at its real group size for a 1080p capture gives about **495 ms per output frame at flow scale 1.0 and about 136 ms at 0.5**, against a 16-33 ms budget. Shader 258 alone is about 324 ms of the first figure. This points to "too slow" for the heavy mode on this phone, but it is NOT a verdict: the data is zero-filled, image formats and sizes are guesses, the loop counts and whether each iteration changes sizes are unresolved, the lighter mode (`[this+8]`=1, ids 280-301) and engine A are untested, and a GPU capture of the real app would confirm the dispatch list.
 
 Known design points: framegen adds at least one frame of latency, and it needs history buffers at the game's resolution (size to be computed from the real shader inputs, not estimated here). If the pack is missing or pipeline creation fails, present normally and log `[vk] framegen: pack not found, presenting normally`.
 
