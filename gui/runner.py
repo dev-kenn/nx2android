@@ -48,7 +48,10 @@ class Porter(QObject):
     def _done(self, code, _status):
         if self.buf.strip(): self.buf += b'\n'; self._out()
         err = ''.join(self.err).strip()
-        if code and err: self.event.emit({'ev': 'say', 'msg': '[RED] ' + err.splitlines()[-1]})   # a traceback's last line (the JSON stream has the error's message too)
+        if code and err:   # a traceback's last line (the JSON stream has the error's message too), and the frame it was raised in: a frozen bundle ends with PyInstaller's own line
+            lines = [ln for ln in err.splitlines() if ln.strip() and not ln.startswith('[PYI-')] or err.splitlines()
+            frame = next((ln.strip() for ln in reversed(lines) if ln.lstrip().startswith('File "')), None)
+            self.event.emit({'ev': 'say', 'msg': '[RED] ' + (f'{frame}: ' if frame else '') + lines[-1].strip()})
         self.finished.emit(code)
 
     def cancel(self):
@@ -57,13 +60,31 @@ class Porter(QObject):
         else: os.killpg(self.p.processId(), signal.SIGKILL)
 
 
-def call_json(parent, args, done):
-    """A short porter command that prints one JSON document: done(obj or None, exit code)"""
+def call_json(parent, args, done, *, failed=None):
+    """One JSON document: done(obj or None, code); optionally failed(message, code) for process/output errors.
+
+    Valid JSON, including structured errors and unsupported inspect results (exit 2), always reaches done.
+    """
     p = _porter(parent, args)
-    def fin(code, _status):
+    completed = False
+    def finish(obj, code, error=None):
+        nonlocal completed
+        if completed: return
+        completed = True
+        try:
+            if error is not None and failed: failed(error, code)
+            else: done(obj, code)
+        finally: p.deleteLater()
+    def fin(code, status):
+        if completed: return
         out = bytes(p.readAllStandardOutput()).decode('utf-8', 'replace')
+        err = bytes(p.readAllStandardError()).decode('utf-8', 'replace').strip()
         try: obj = json.loads(out)
-        except ValueError: obj = None
-        done(obj, code); p.deleteLater()
-    p.finished.connect(fin); p.start()
+        except ValueError:
+            reason = 'porter crashed' if status == QProcess.CrashExit else f'porter exited with code {code}' if code else 'porter returned invalid or empty JSON'
+            finish(None, code, reason + (':\n' + err if err else '.'))
+        else: finish(obj, code)
+    def error(kind):
+        if kind == QProcess.FailedToStart: finish(None, -1, 'Could not start porter: ' + p.errorString())
+    p.errorOccurred.connect(error); p.finished.connect(fin); p.start()
     return p

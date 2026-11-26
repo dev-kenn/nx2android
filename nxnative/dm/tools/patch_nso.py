@@ -84,6 +84,10 @@ def load_patches():
     return tables, where
 PATCHES, PATCH_WHERE = load_patches()
 BUILD_ID = d[0x40:0x50].hex()
+FS_STATE_OFF = 0
+if BUILD_ID in PATCHES['FRAME_STEP'] and NAME == 'main':
+    FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
+    PATCH_OFF = max(PATCH_OFF, (FS_STATE_OFF + 0x4000 + 0xFFFF) & ~0xFFFF)
 cuts = list(PATCHES['CUTS'].get(BUILD_ID, []))
 for off, ob, nb, why in cuts:
     ob, nb = bytes.fromhex(ob), bytes.fromhex(nb)
@@ -373,7 +377,9 @@ def site_window(seg):
         elif m == 'b':   # an unconditional branch inside a CAS window (e.g. ldaxrb; cbz <store>; clrex; b <after>; stlxrb; cbz)
             tgt = x.operands[-1].imm
             if lo <= tgt < hi: newt = copy0 + (tgt - lo)
-            elif tgt == hi: newt = exits
+            elif tgt == hi: newt = exits - 16   # the fall-through stub, which is the first one (exits is the first branch-out stub). It took exits: with ldaxrb; cbz <store>; clrex; b <after>;
+                                                # stlxrb; cbz <claimed>, a slot found in use left by the stub of <claimed> (Trails in the Sky 1st Chapter main+0x2cdeb4, its material table's
+                                                # slot search: two materials got one slot, and the one drawn with the other's entry took its glow, AYN Odin 3, 2026-11-17)
             else:
                 if tgt not in ex_targets: ex_targets.append(tgt)
                 newt = exits + 16 * ex_targets.index(tgt)
@@ -561,15 +567,21 @@ def jump_offsets(insl, j, copy_first=False, far_base=False):
         p = ctx[i]
         m = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
         if m and m.group(1) in idx: idx.add(m.group(2)); continue
+        # A 32-bit zero-extension written into the index register is a copy of the index, not a mask of the checked value (Layton's Mystery Journey DX
+        # main+0x1eb2e0: cmp w10,#3; b.hi; and x18,x10,#0xffffffff; ldrsw x18,[x15,x18,lsl #2]; add x18,x18,x15; br x18)
+        m = re.fullmatch(r'([wx]\d+), ([wx]\d+), #0xffffffff', p.op_str) if p.mnemonic == 'and' else None
+        if m and wname(m.group(1)) in idx and m.group(1) != m.group(2): idx.add(wname(m.group(2))); continue
         m = re.fullmatch(r'([wx]\d+), ([wx]\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'and' else None
         if m and wname(m.group(1)) in idx and masked is None: masked = (wname(m.group(2)), int(m.group(3), 0), i); continue
-        m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+        # A 64-bit check of the index bounds it as well (OCTOPATH TRAVELER 1.0.5 main+0x1676f30: cmp x22,#0x10; ...; b.hi; adrp x18 + add x18; mov x0,x18; ldrsw x18,[x0,x22,lsl #2];
+        # add x18,x18,x0, the base copied, so only far_base reads it); taken only in the last attempt, so sites that rewrote before come out the same
+        m = re.fullmatch(r'([wx]\d+), #(0x[0-9a-f]+|\d+)' if far_base else r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
         if not m: continue
-        if m.group(1) in idx: cmp = p; break
+        if wname(m.group(1)) in idx: cmp = p; break
         if masked:   # the checked register must be "the same source & the same mask", with the source unchanged up to the index's and
             for q in range(i - 1, -1, -1):
                 w = [wname(ctx[q].reg_name(r)) for r in ctx[q].regs_access()[1]]
-                if m.group(1) not in w: continue
+                if wname(m.group(1)) not in w: continue
                 mm = re.fullmatch(r'([wx]\d+), ([wx]\d+), #(0x[0-9a-f]+|\d+)', ctx[q].op_str) if ctx[q].mnemonic == 'and' else None
                 if mm and wname(mm.group(2)) == masked[0] and int(mm.group(3), 0) == masked[1] and \
                    not any(masked[0] in [wname(ctx[z].reg_name(r)) for r in ctx[z].regs_access()[1]] for z in range(q + 1, masked[2])):
@@ -638,7 +650,8 @@ def copied_base(insl, k, rb):
     return None
 def jump_adr_offsets(insl, j):
     """Entries relative to an adr rather than to the table (Tears of the Kingdom main+0x393bb0): cmp w0,#5; b.hi; ...; adr x18,#L; ldrsw x1,[x17,x0,lsl #2];
-    add x18,x18,x1; br x18 → target = L + entry, with the table base x17 from adrp + add. Tried only where jump_offsets finds nothing. Returns all targets, or None if not recognized"""
+    add x18,x18,x1; br x18 → target = L + entry, with the table base x17 from adrp + add. A 64-bit compare bounds the index too (DRAGON QUEST I & II HD-2D Remake 1.0.2,
+    main+0x30ee50c: cmp x9,#4; b.hi; adr x18; ldrsw x0,[x15,x9,lsl #2]; add x18,x18,x0). Tried only where jump_offsets finds nothing. Returns all targets, or None if not recognized"""
     ctx = insl[max(0, j - 16):j]
     add = next((p for p in reversed(ctx) if p.mnemonic == 'add' and re.fullmatch(r'x18, x\d+, x\d+', p.op_str)), None)
     if not add: return None
@@ -648,13 +661,15 @@ def jump_adr_offsets(insl, j):
         wa = next((p for p in reversed(ctx[:ka]) if any(p.reg_name(r) == a for r in p.regs_access()[1])), None)   # the nearest writer of a
         if not ld or not wa or wa.mnemonic != 'adr': continue
         tb_reg, ix = re.fullmatch(rf'{e}, \[(x\d+), x(\d+), lsl #2\]', ld.op_str).groups()
-        idx, cmp = {'w' + ix}, None   # the index and the registers copied into it (main+0x596d30: cmp w15,#8; b.hi; mov w16,w15; ...; ldrsw x0,[x17,x16,lsl #2])
+        idx, cmp = 'w' + ix, None   # follow the value used at the load back through copies (main+0x596d30: cmp w15,#8; b.hi; mov w16,w15; ...; ldrsw x0,[x17,x16,lsl #2])
         for p in reversed(ctx[:ctx.index(ld)]):   # walk back from the load to the bounds check
             m = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
-            if m and m.group(1) in idx: idx.add(m.group(2)); continue
-            m = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
-            if m and m.group(1) in idx: cmp = p; break
-            if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+            if m and m.group(1) == idx: idx = m.group(2); continue
+            m = re.fullmatch(r'([wx]\d+), ([wx]\d+), #0xffffffff', p.op_str) if p.mnemonic == 'and' else None   # a 32-bit zero-extension into the index is a copy
+            if m and 'w' + m.group(1)[1:] == idx and m.group(1) != m.group(2): idx = 'w' + m.group(2)[1:]; continue
+            m = re.fullmatch(r'[wx](\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+            if m and 'w' + m.group(1) == idx: cmp = p; break
+            if any('w' + p.reg_name(r)[1:] == idx for r in p.regs_access()[1]): return None   # the index changes after the check
         if cmp is None: return None
         n, at = int(cmp.op_str.split('#')[1], 0) + 1, wa.operands[1].imm
         def targets(tb): return [at + struct.unpack_from('<i', IMG, tb + 4 * i)[0] for i in range(n)] if 0 <= tb and tb + 4 * n <= len(IMG) else None
@@ -709,13 +724,13 @@ def half_count(insl, ld, base):
     m = re.fullmatch(r'w\d+, \[(x\d+), [wx](\d+), (?:lsl|uxtw) #1\]', ld.op_str) if ld.mnemonic == 'ldrh' else None
     if not m: return None
     tb_reg, k = m.group(1), insl.index(ld)
-    idx, cmp = {'w' + m.group(2)}, None
+    idx, cmp = 'w' + m.group(2), None
     for p in reversed(insl[max(0, k - 32):k]):   # walk back from the load to the bounds check
         mm = re.fullmatch(r'(w\d+), (w\d+)', p.op_str) if p.mnemonic == 'mov' else None
-        if mm and mm.group(1) in idx: idx.add(mm.group(2)); continue
-        mm = re.fullmatch(r'(w\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
-        if mm and mm.group(1) in idx: cmp = p; break
-        if any('w' + p.reg_name(r)[1:] in idx for r in p.regs_access()[1]): return None   # the index changes after the check
+        if mm and mm.group(1) == idx: idx = mm.group(2); continue
+        mm = re.fullmatch(r'[wx](\d+), #(0x[0-9a-f]+|\d+)', p.op_str) if p.mnemonic == 'cmp' else None
+        if mm and 'w' + mm.group(1) == idx: cmp = p; break
+        if any('w' + p.reg_name(r)[1:] == idx for r in p.regs_access()[1]): return None   # the index changes after the check
     kc = insl.index(cmp) if cmp is not None else -1
     if kc < 0 or insl[kc + 1].mnemonic not in ('b.hi', 'b.hs', 'b.cs'): return None   # only a compare that guards the dispatch bounds the index (b.hs: one entry more than needed)
     n = int(cmp.op_str.split('#')[1], 0) + 1
@@ -782,7 +797,11 @@ if any(fb - fa > BIG_FN for fa, fb in funcs):
         split += [(p, q) for p, q in ps if bisect.bisect_left(sites18, p) < bisect.bisect_left(sites18, q)]   # the pieces that hold x18 sites
         print(f'function {fa:#x}..{fb:#x} ({(fb - fa) / 2**20:.2f} MB, no unwind entries) analysed in {len(ps)} pieces')
     funcs = split
-for fa, fb in funcs:
+# The long part: every piece is disassembled with its details, and a big function without unwind entries has hundreds of
+# them (OCTOPATH TRAVELER 0's main: 71 MB in 298 pieces). The progress is printed, so the wait is not a silence.
+pieces_total = sum(fb - fa for fa, fb in funcs); pieces_done = 0
+for pi, (fa, fb) in enumerate(funcs):
+    if pi % 4 == 0: print(f'progress: {pieces_done / 2**20:.1f} MB of {pieces_total / 2**20:.1f} MB ({pi + 1}/{len(funcs)} pieces)', flush=True)
     insl = disasm_fn(fa, fb)
     ws = find_windows(insl)
     for wseg in ws:
@@ -831,6 +850,7 @@ for fa, fb in funcs:
     for a_, tgt in tabjumps.items():
         if fa <= a_ < fb: assert not any(t in inwin and t not in heads for t in tgt), f'jump table target into window {a_:x}'
     rmid_all |= rmid
+    pieces_done += fb - fa
 if far_into:   # functions analysed in pieces (pieces above): their far b / bl, and every jump table's targets (a cut may follow a br x18), may not land inside a window or a retry block
     win_mid = {x.address for wseg in windows for x in wseg[1:]}
     for at, to in far_into: assert to not in win_mid and to not in rmid_all, f'far branch into a window or retry block {at:x}'
@@ -903,10 +923,8 @@ for off, oid, ow, why in obs:
 # A build's stubs are FRAME_STEP[build ID](ctx) in its patches.py: ctx.here() / ctx.emit(word) assemble into the patch area, ctx.site(offset, original bytes) asserts a site and that it is
 # no rewrite site, ctx.put(offset, words, reason) writes it (listed with the cuts), ctx.state is the state page's offset, and ctx.render_scale = 1 marks a render-scale stub
 FRAME_STEP = PATCHES['FRAME_STEP']
-FS_STATE_OFF = 0
 RENDER_SCALE = 0   # 1 = the build has a render-scale stub (state +0x10): the fixups table says so (RENDER_SCALE), and the iOS launcher offers the setting (dm/games/settings.tsv)
 if BUILD_ID in FRAME_STEP and NAME == 'main':
-    FS_STATE_OFF = KEY_PAGE_OFF + 0x4000
     assert not FAR and FS_STATE_OFF % 0x1000 == 0 and FS_STATE_OFF + 0x40 <= PATCH_OFF and not any(IMG[FS_STATE_OFF:]), 'frame step state page'
     def fs_site(off, orig):
         ob = bytes.fromhex(orig)
@@ -1017,6 +1035,11 @@ def spin_quick(T, hi):
 class SpinNo(Exception): pass
 def spin_region(T, bes):
     """the spin wait region with head T (bes: the backward branches to T found by the scan) → dict, or None"""
+    # Heads are visited in ascending order, and decoding stays within SPIN_WIN
+    # bytes of each head. Retire earlier details instead of caching every rejected
+    # loop in the module; keep overlap shared by the graphs awaiting emission.
+    for a in list(spin_dec):
+        if a < T: del spin_dec[a]
     hi = max(bes)
     if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
     nodes, back, bad, inner = {}, set(), set(), set()

@@ -1,5 +1,6 @@
 """Decode known blocks and compare independent Pillow BC decoders, without game data."""
 import ctypes as C
+import os
 from pathlib import Path
 import random
 import shutil
@@ -9,6 +10,10 @@ import tempfile
 import unittest
 
 from PIL import Image
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import csrc  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 TEX = ROOT / 'nxnative/dm/gfx/tex'
@@ -21,7 +26,7 @@ class BCDecode(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         lib = Path(cls.tmp.name) / 'bc.so'
         source = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text()
-        adapter = source[source.index('static void bc_decode('):source.index('static pthread_mutex_t g_fmt_mu')]
+        adapter = csrc.between(source, 'static void bc_decode(', 'static pthread_mutex_t g_fmt_mu')
         wrapper = Path(cls.tmp.name) / 'adapter.c'
         wrapper.write_text('#include <stdint.h>\n#include <stdlib.h>\n#include "nvn_bc.h"\n'
                            'typedef struct {unsigned dec, dbpp;} vkfmt_t;\n'
@@ -46,6 +51,8 @@ class BCDecode(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if os.name == 'nt':   # Windows keeps a loaded DLL's file locked: unload it before the folder goes
+            C.windll.kernel32.FreeLibrary(C.c_void_p(cls.lib._handle))
         cls.tmp.cleanup()
 
     def block(self, fmt, data):

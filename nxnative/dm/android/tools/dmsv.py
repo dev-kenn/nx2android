@@ -8,7 +8,7 @@
 #   compresses 3.5-3.6x at zstd level 3 on its own, so the host can still decompress one shader at a time. A module that does not get smaller is stored as it is.
 #   dmsv.py info <bundle>                              its version, shaders, SPIR-V stored and decompressed
 #   dmsv.py pack <bundle> <out> [--level N] [--jobs N]  the same shaders in the other form (--level 0: version 1, uncompressed), every module read back and compared
-import argparse, concurrent.futures as cf, mmap, os, struct, sys
+import argparse, concurrent.futures as cf, contextlib, mmap, os, stat, struct, sys, tempfile
 
 MAGIC, HDR, ENT = b'DMSV', struct.Struct('<4sII'), struct.Struct('<QIIIIII')
 # zstd level 3, zstd's own default (1 does as well on this SPIR-V, within 1%). Each module on its own, the whole SPIR-V of three bundles (Mac M4 Pro; MB/s: one thread's CPU time):
@@ -30,40 +30,88 @@ def zstd_mod():   # compression.zstd from Python 3.14, its backport before (pip 
     return zstd
 
 
+def spv_bytes(spv):
+    # Exporters keep translated modules on disk; callers with bytes keep the old API.
+    if isinstance(spv, os.PathLike):
+        with open(spv, 'rb') as f: return f.read()
+    return spv
+
+
 def write(path, entries, level=LEVEL, jobs=None):
     """entries [(key, stage, spv, refl)] → a bundle at path: version 2 with each module's SPIR-V zstd-compressed at level, in jobs threads (zstd lets go of the GIL: 7x faster
-    on 12 threads), or version 1 with level 0 or in a Python without zstd. Written as it goes (the old writer joined the whole bundle in memory, twice its size).
+    on 12 threads), or version 1 with level 0 or in a Python without zstd. spv may
+    be bytes or a PathLike to an immutable module. Only jobs payloads are queued;
+    completed batches are written before loading the next ones.
+    Verified in a private sibling directory, then atomically replaces path. A write,
+    verification or replace failure leaves the old bundle intact (shader_vk.py
+    calls this directly, without the CLI repacker's former .partial protection).
     Returns (version, SPIR-V bytes, SPIR-V bytes stored)"""
     entries = sorted(entries, key=lambda e: e[0]); z = zstd_mod() if level else None
     if level and not z: print('[RED] this Python has no zstd (compression.zstd from Python 3.14, or pip install backports.zstd): the shader bundle is written uncompressed (version 1)', flush=True)
+    workers = max(1, jobs or os.cpu_count() or 4)
     if z:
         P = z.CompressionParameter; opt = {P.compression_level: level, P.checksum_flag: 1}
-        def pack(spv):
+    def pack(source):
+        spv = spv_bytes(source)
+        if z:
             c = z.compress(spv, options=opt)
             return (c, len(spv)) if len(c) < len(spv) else (spv, 0)
-        with cf.ThreadPoolExecutor(jobs or os.cpu_count() or 4) as ex: stored = list(ex.map(pack, [e[2] for e in entries], chunksize=8))
-    else: stored = [(e[2], 0) for e in entries]
+        return spv, 0
+    def packed():
+        if not z:
+            for e in entries: yield pack(e[2])
+            return
+        # Silver Pines' 66k-shader export was reported killed during compression:
+        # eager map submitted every module and kept all compressed results too.
+        # Batch explicitly for Python versions before Executor.map(buffersize=).
+        with cf.ThreadPoolExecutor(workers) as ex:
+            for start in range(0, len(entries), workers):
+                yield from ex.map(pack, (e[2] for e in entries[start:start + workers]))
     ver, off, table = 2 if z else 1, HDR.size + ENT.size * len(entries), []
-    for (key, st, spv, refl), (s, n) in zip(entries, stored):
-        table.append(ENT.pack(key, st, off, len(s), off + len(s), len(refl), n)); off += len(s) + len(refl)
-    with open(path, 'wb') as f:
-        f.write(HDR.pack(MAGIC, ver, len(entries)) + b''.join(table))
-        for (_, _, _, refl), (s, _) in zip(entries, stored): f.write(s); f.write(refl)
-    return ver, sum(len(e[2]) for e in entries), sum(len(s) for s, _ in stored)
+    raw = stored = 0
+    # Same filesystem for atomic rename; a unique directory also isolates concurrent
+    # exporters. This preserves nxnative's staged-export contract in the DMSV format.
+    path = os.path.abspath(path)
+    with tempfile.TemporaryDirectory(prefix='.dmsv-', dir=os.path.dirname(path)) as scratch:
+        tmp = os.path.join(scratch, 'bundle.dmsv')
+        with open(tmp, 'wb') as f, contextlib.closing(packed()) as results:
+            f.write(HDR.pack(MAGIC, ver, len(entries)) + bytes(ENT.size * len(entries)))
+            for (key, st, _, refl), (s, n) in zip(entries, results):
+                table.append(ENT.pack(key, st, off, len(s), off + len(s), len(refl), n)); off += len(s) + len(refl)
+                f.write(s); f.write(refl); raw += n or len(s); stored += len(s)
+            f.seek(HDR.size); f.write(b''.join(table))
+            f.flush(); os.fsync(f.fileno())
+        with Bundle(tmp) as check:
+            if check.version != ver or len(check.entries) != len(entries):
+                raise ValueError('shader bundle header did not read back correctly; previous bundle retained')
+            for expected, actual in zip(entries, check.entries):
+                if actual[:2] != expected[:2] or check.spv(actual) != spv_bytes(expected[2]) or check.refl(actual) != expected[3]:
+                    raise ValueError(f'shader {expected[0]:016x} did not read back correctly; previous bundle retained')
+        # Close the verifier's mapping before replace, including on Windows.
+        try: mode = stat.S_IMODE(os.stat(path).st_mode)
+        except FileNotFoundError: pass
+        else: os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    return ver, raw, stored
 
 
 class Bundle:
     """A bundle mapped read-only: version, entries [(key, stage, spv_off, spv_len, refl_off, refl_len, spv_size)], spv(e) and refl(e) of an entry"""
     def __init__(self, path):
-        self.path, self.f = path, open(path, 'rb')
-        self.m = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ) if os.fstat(self.f.fileno()).st_size else b''
-        magic, self.version, n = HDR.unpack_from(self.m) if len(self.m) >= HDR.size else (b'', 0, 0)
-        if magic != MAGIC or self.version not in (1, 2): self.close(); raise ValueError(f'{path}: not a shader bundle of version 1 or 2 ({magic!r}, version {self.version})')
-        if HDR.size + ENT.size * n > len(self.m): self.close(); raise ValueError(f'{path}: {n} entries run past the file ({len(self.m)} bytes)')
-        self.entries = [ENT.unpack_from(self.m, HDR.size + ENT.size * i) for i in range(n)]
-        bad = [e for e in self.entries if e[2] + e[3] > len(self.m) or e[4] + e[5] > len(self.m)]
-        if bad: self.close(); raise ValueError(f'{path}: {len(bad)} shaders past the end of the file (a partial copy?), the first {bad[0][0]:016x}')
-        self.z = None
+        self.path, self.f, self.m = path, open(path, 'rb'), b''
+        try:
+            self.m = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ) if os.fstat(self.f.fileno()).st_size else b''
+            magic, self.version, n = HDR.unpack_from(self.m) if len(self.m) >= HDR.size else (b'', 0, 0)
+            if magic != MAGIC or self.version not in (1, 2): raise ValueError(f'{path}: not a shader bundle of version 1 or 2 ({magic!r}, version {self.version})')
+            if HDR.size + ENT.size * n > len(self.m): raise ValueError(f'{path}: {n} entries run past the file ({len(self.m)} bytes)')
+            self.entries = [ENT.unpack_from(self.m, HDR.size + ENT.size * i) for i in range(n)]
+            bad = [e for e in self.entries if e[2] + e[3] > len(self.m) or e[4] + e[5] > len(self.m)]
+            if bad: raise ValueError(f'{path}: {len(bad)} shaders past the end of the file (a partial copy?), the first {bad[0][0]:016x}')
+            self.z = None
+        except BaseException:
+            # __exit__ is not called when construction fails; release handles now
+            # so Windows can remove staging while the exception traceback lives.
+            self.close(); raise
 
     def spv(self, e):
         b = self.m[e[2]:e[2] + e[3]]
@@ -96,12 +144,7 @@ def main(argv=None):
               f' ({raw / max(stored, 1):.2f}x); reflection {sum(e[5] for e in b.entries) / 2**20:,.1f} MB')
         if a.cmd == 'info': return 0
         entries = [(e[0], e[1], bytes(b.spv(e)), bytes(b.refl(e))) for e in b.entries]
-    tmp = a.out + '.partial'
-    ver, raw, stored = write(tmp, entries, a.level, a.jobs)
-    with Bundle(tmp) as o:   # every module read back
-        bad = [f'{e[0]:016x}' for e, x in zip(entries, o.entries) if (x[0], x[1]) != e[:2] or o.spv(x) != e[2] or o.refl(x) != e[3]] if len(o.entries) == len(entries) else ['(the count)']
-    if bad: os.remove(tmp); print(f'[RED] {len(bad)} shaders did not read back as they were written, the first {bad[0]}: nothing written', file=sys.stderr); return 1
-    os.replace(tmp, a.out)
+    ver, raw, stored = write(a.out, entries, a.level, a.jobs)
     print(f'{a.out}: version {ver}, {len(entries):,} shaders, {os.path.getsize(a.out) / 2**20:,.1f} MB; SPIR-V {raw / 2**20:,.1f} MB, stored {stored / 2**20:,.1f} MB ({raw / max(stored, 1):.2f}x);'
           f' every module read back byte for byte')
     return 0

@@ -1,64 +1,35 @@
 // Engine frame limits kept in game memory (FPSLocker's evaluate_write entries): some engines cap their own frame rate with a value the host can raise. The target is the profile's
 // fps_target (DM_FPS_TARGET overrides; 0 = leave the game's own limit), the same key that drives Tears of the Kingdom's frame step (loader.c install_fps_state). Called on every present
 // (hle_nvn.c); the game sets the values after boot and may set them again, so each is written whenever it differs. Fixed addresses: each row runs only on the main build it was found in (AGENTS.md).
-// A port can also bring rows of its own from a FPSLocker config of its main build (DM_FPS_LOCKS, "Imported rows" below)
+// A port can also bring rows of its own from a FPSLocker config of its main build (DM_FPS_LOCKS, "Imported rows" below).
+// The rows of a profile are its fps_locks.tsv (dm/games/game.py writes them into game_profile.h as DM_GAME_FPS_LOCKS); the notes on each row are there too
 #include "hle.h"
+#include "dm_pacing.h"   // the frame-pacing policy
 #include <mach/mach.h>
 #include <sys/mman.h>
 
-// What a field holds: the frame rate as a float, vsyncs per frame (60 / frame rate) as an int32, or the frame time in milliseconds or seconds as a float. Copies: consecutive copies of the value
+// What a field holds: the frame rate as a float or int32, vsyncs per frame (60 / frame rate) as an int32, or the frame time in milliseconds or seconds as a float. Copies: consecutive copies of the value
 // (Unreal keeps one for the game thread, one for the render thread). A row with no pointer (ptr_off 0) has its field at main + field: a constant in main's read-only data, which the loader
 // leaves writable (the image's data block on iOS too, loader.c map_image).
 // At 60 a frame time gets MS_MARGIN less than the vsync: such a limiter counts from the frame's start, and the work after it (the GPU fence wait, the next frame's start) adds to the
 // period, so frames at exactly 16.667 ms came 0.11 ms late each on the Mac (59.6 fps, every 150th frame shown two vsyncs). Slightly shorter, the host's present pacing sets the pace
 // (the acquire waits): Luigi's Mansion 3's display interval p99 18.69 → 16.67 ms, 60.0 fps. Not at 30: with present_interval display the presents follow every vsync and hold no
 // frame for two, so a shorter time showed some frames for one (30.4 fps); 30 writes the game's own 33.333 ms
-enum { FPS_F32, VSYNCS_I32, MS_F32, SEC_F32 };
+enum { FPS_F32, VSYNCS_I32, MS_F32, SEC_F32, FPS_I32 };
 #define MS_MARGIN 0.5f
 static float ms_want(int fps) { return 1000.0f / (float)fps - (fps == 60 ? MS_MARGIN : 0); }
 static const struct { const char *build, *what; uint64_t ptr_off; uint32_t field; uint8_t kind, copies; uint32_t ptr2; } k_locks[] = {   // ptr2: a second pointer at that object + ptr2 (an IL2CPP class's static fields), 0 = none
-    // Monster Hunter Rise 16.0.2: RE Engine's frame limit, a float at [main+0x1295b3f0]+0x434 (the pointer is a global in main's bss). The frame loop (main+0x6b106c8) sleeps until
-    // [+0x430] / [+0x434] sixtieths of a second have passed ([+0x430] = 60) and steps the game by the time that really passed (+0x41c), so a higher limit runs the game faster in frames
-    // at the same speed. The game sets 30 after boot; it also asks for present interval 2, which the profile's present_interval display ignores.
-    // From masagrator's FPSLocker config for this build (FPSLocker-Warehouse, patches/0100B04011742000/C9A3DD7702075ECD.yaml)
-    { "c9a3dd7702075ecd90101f4555389582", "RE Engine frame limit", 0x1295b3f0, 0x434, FPS_F32, 1 },
-    // Octopath Traveler 0 1.0.5: Unreal Engine 5's console variables t.MaxFPS (the game thread's frame limit: it sleeps until 1 / t.MaxFPS has passed and steps the game by the time that
-    // really passed) and rhi.SyncInterval (vsyncs per present: the RHI's present interval). Each is a TAutoConsoleVariable in main's bss (vtable, the console object, then at +0x10 the pointer to
-    // its value: the game thread's copy, then the render thread's). The game's config sets t.MaxFPS 30 ([ConsoleVariables] of DefaultEngine.ini; FrameRateLimit=30 of SwitchGameUserSettings.ini
-    // sets it again) and rhi.SyncInterval 2 (SwitchDeviceProfiles.ini), so the game asks for present interval 2. Found from the names' references in the static constructors that register them
-    // (main+0x2ca6524, main+0x1026e54; RegisterConsoleVariable, then AsVariableFloat / AsVariableInt stored at +0x10)
-    { "9fe60a212cff9b9a3656ab63d4f882e5", "Unreal t.MaxFPS", 0x7c738d0 + 0x10, 0, FPS_F32, 2 },
-    { "9fe60a212cff9b9a3656ab63d4f882e5", "Unreal rhi.SyncInterval", 0x7b32690 + 0x10, 0, VSYNCS_I32, 2 },
-    // DRAGON QUEST XI S 1.0.4: Unreal Engine 4.18's t.MaxFPS and nvn.SyncInterval (the Switch RHI's present interval), the same TAutoConsoleVariable layout. The game's config sets
-    // FrameRateLimit=30 (DefaultGameUserSettings.ini) and nvn.SyncInterval=2 (JackGame/Config/Switch/SwitchEngine.ini). Found from the names' references (UTF-32, as the engine's TCHAR on
-    // the Switch) in the static constructors: main+0x1e7f98 (TAutoConsoleVariable<float> constructor main+0x6ee0e0, AsVariableFloat stored at +0x10) and main+0x21c00c
-    { "1719aabfa5eae42b132b65770b871288", "Unreal t.MaxFPS", 0x8501c38 + 0x10, 0, FPS_F32, 2 },
-    { "1719aabfa5eae42b132b65770b871288", "Unreal nvn.SyncInterval", 0x85270b8 + 0x10, 0, VSYNCS_I32, 2 },
-    // DRAGON QUEST VII Reimagined 1.2.0: Unreal Engine 4.27's t.MaxFPS and rhi.SyncInterval, the same layout (names in UTF-16, the engine's TCHAR in this build). The game's config sets
-    // FrameRateLimit=30 (DefaultGameUserSettings.ini, SwitchGameUserSettings.ini) and rhi.syncinterval=2 (SwitchDeviceProfiles.ini). Registered at main+0x4a61b40 (float, AsVariableFloat
-    // stored at +0x10) and main+0x36164f4 (int, AsVariableInt at +0x10)
-    { "f7ec03e4cb9de3bd8319d4e899d2e9cc", "Unreal t.MaxFPS", 0x7f41908 + 0x10, 0, FPS_F32, 2 },
-    { "f7ec03e4cb9de3bd8319d4e899d2e9cc", "Unreal rhi.SyncInterval", 0x7dedf38 + 0x10, 0, VSYNCS_I32, 2 },
-    // FINAL FANTASY RESONANCE 1.0.1: Unreal Engine 5.6.1's t.MaxFPS and rhi.SyncInterval, the same layout (names in UTF-16). The engine's Switch device profile sets rhi.syncinterval=2
-    // (BaseSwitchDeviceProfiles.ini). Registered at main+0x33a4dec (float, IConsoleManager slot 2; AsVariableFloat stored at +0x10) and main+0x149e0bc (int, slot 1; AsVariableInt at +0x10)
-    { "84e182f72ee1da4f477804bd05b54c15", "Unreal t.MaxFPS", 0x8c29af0 + 0x10, 0, FPS_F32, 2 },
-    { "84e182f72ee1da4f477804bd05b54c15", "Unreal rhi.SyncInterval", 0x8adca10 + 0x10, 0, VSYNCS_I32, 2 },
-    // Luigi's Mansion 3 1.4.0: Next Level Games' frame limiter. At the end of each frame the main thread calls the frame callbacks (main+0xb7c308) with the milliseconds since the frame
-    // started; the limiter (main+0x7a3e70) runs jobs or sleeps until 33.333 ms have passed, the float at main+0x13c94dc (read only there, at main+0x7a3ea8 and main+0x7a3f18), and the game
-    // steps by the time that really passed. The game asks for present interval 2 too, which the profile's present_interval display ignores; both are needed
-    { "79e5950ffa85acf63e28c9aec051eac2", "NLG frame limiter target", 0, 0x13c94dc, MS_F32, 1 },
-    // Graveyard Keeper 2 1.0.4: Unity 6's vsync count and frame time, globals in main's data. Its vsync-count setter (main+0xd47310) stores the count (at least 1) at main+0x7d869d8 and
-    // count / 60 seconds at main+0x7d869e4, which the frame pacing (main+0xd587f4) waits for 0.9 of after the last vsync; the game sets 2. Found from masagrator's FPSLocker config for
-    // 1.0.2 (FPSLocker-Warehouse, patches/0100005027A18000/D8AEEEB4E7F1AB63.yaml: the same two fields, 1 / 62 s at 60), whose reference bytes occur once in this build's data
-    { "1d69f09fc684a7d1cbd778b90a5df1e5", "Unity vsync count", 0, 0x7d869d8, VSYNCS_I32, 1 },
-    { "1d69f09fc684a7d1cbd778b90a5df1e5", "Unity frame time", 0, 0x7d869e4, SEC_F32, 1 },
-    // Advance Wars 1+2: Re-Boot Camp 1.0.0: Unity 2020.2's OnDemandRendering.renderFrameInterval, an IL2CPP static int: main+0x481b2f8 holds the class (Il2CppClass), whose +0xb8 points to its
-    // static fields, the interval first. The game sets 1 in the menus and 2 in battle (Unity then renders every second frame: 30 fps, the frame's work 33 ms with the CPU and GPU idle).
-    // From masagrator's FPSLocker config for this build (FPSLocker-Warehouse, patches/0100300012F2A000/320A17744AEFD67F.yaml, which writes -1); 1 renders every frame as well.
-    // The host's log of that config on the Y700 read 1 at the title and 2 in the first training battle
-    { "320a17744aefd67fec5738ca0c629795", "Unity render frame interval", 0x481b2f8, 0, VSYNCS_I32, 1, 0xb8 },
+#ifdef DM_GAME_FPS_LOCKS
+    DM_GAME_FPS_LOCKS   // the profile's fps_locks.tsv (dm/games/game.py)
+#else
+    { NULL }
+#endif
 };
-#define NLOCKS ((int)(sizeof k_locks / sizeof k_locks[0]))
+#ifdef DM_GAME_FPS_LOCKS
+#define NLOCKS DM_GAME_FPS_LOCKS_N
+#else
+#define NLOCKS 0
+#endif
 
 static int rd(uint64_t a, void *out, size_t n) { vm_size_t got = 0; return a >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n; }
 // the same, for the debug reads (peek, memdump): pages mapped but not readable that way, a GPU memory pool shared with the device (Android's zero-copy pools are
@@ -169,8 +140,7 @@ void dm_fps_lock_tick(void) {
             else if (!nrow) { imp_load(g_mod[i].build_id); if (g_nimp) base = g_mod[i].base; }
         }
         if (!nrow && !g_nimp) return;
-        const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET; src = e ? "DM_FPS_TARGET" : "game profile fps_target";
-        if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; leaving the game's frame limit", e); t = 0; }
+        int t = dm_pacing_target(&src);   // dm_pacing.c
         if (!t) { for (int r = 0; r < nrow; r++) LOG("main: %s left as the game sets it (%s)", k_locks[rows[r]].what, src);
                   if (g_nimp) LOG("main: %d FPSLocker write(s) left out (%s 0)", g_nimp, src); return; }
         target = t; state = 0;
@@ -183,20 +153,21 @@ void dm_fps_lock_tick(void) {
         for (int c = 0; c < k_locks[k].copies; c++) {
             uint64_t a = obj + k_locks[k].field + 4 * (uint64_t)c; uint32_t cur, want; char was[16];
             if (!rd(a, &cur, sizeof cur)) break;
-            if (k_locks[k].kind != VSYNCS_I32) {
+            if (k_locks[k].kind != VSYNCS_I32 && k_locks[k].kind != FPS_I32) {
                 int ms = k_locks[k].kind == MS_F32 ? 1 : k_locks[k].kind == SEC_F32 ? 1000 : 0; float f, w = ms ? ms_want(target) / (float)ms : (float)target; memcpy(&f, &cur, sizeof f); memcpy(&want, &w, sizeof want);
                 if (cur == want || !(ms ? f * (float)ms >= 8 && f * (float)ms <= 100 : f >= 10 && f <= 120)) continue;   // already set, or not set yet (RE Engine: 6000 at boot; Unreal: 0 = no limit until the config sets it)
                 snprintf(was, sizeof was, ms ? "%.3f ms" : "%g", ms ? f * (float)ms : f);
             } else {
-                want = 60 / (uint32_t)target;
-                if (cur == want || cur < 1 || cur > 4) continue;
+                int fps = k_locks[k].kind == FPS_I32;
+                want = fps ? (uint32_t)target : 60 / (uint32_t)target;
+                if (cur == want || cur < (fps ? 10u : 1u) || cur > (fps ? 120u : 4u)) continue;
                 snprintf(was, sizeof was, "%u", cur);
             }
             uint32_t *p = (uint32_t *)(uintptr_t)a;
             dm_guest_write_prepare(p, sizeof *p); __atomic_store_n(p, want, __ATOMIC_RELAXED);
             if (nlog[k] < 8) { nlog[k]++; char now[24];
                 if (k_locks[k].kind == MS_F32 || k_locks[k].kind == SEC_F32) snprintf(now, sizeof now, "%.3f ms (%d fps)", ms_want(target), target);
-                else snprintf(now, sizeof now, "%u%s", k_locks[k].kind == FPS_F32 ? (unsigned)target : want, k_locks[k].kind == FPS_F32 ? " fps" : " vsyncs");
+                else snprintf(now, sizeof now, "%u%s", k_locks[k].kind == FPS_F32 ? (unsigned)target : want, k_locks[k].kind == FPS_F32 || k_locks[k].kind == FPS_I32 ? " fps" : " vsyncs");
                 LOG("main: %s%s %s → %s (%s)", k_locks[k].what, k_locks[k].copies > 1 ? (c ? " (render thread)" : " (game thread)") : "", was, now, src); }
         }
     }

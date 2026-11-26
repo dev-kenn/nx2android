@@ -6,6 +6,7 @@
 #include "gfx_vk.h"
 #include "nvn_hmap.h"
 #include "zstd.h"
+#include "vk_spv_vertex.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <string.h>
@@ -16,19 +17,24 @@
 // spv_size: 0 = the SPIR-V is stored as it is (spv_len bytes; every version 1 entry), else a zstd frame of spv_len bytes that decompresses to spv_size (version 2)
 typedef struct __attribute__((packed)) { uint64_t key; uint32_t stage, spv_off, spv_len, refl_off, refl_len, spv_size; } bent;
 static const uint8_t *g_bundle; static uint32_t g_nent; static const bent *g_ent;
-// Every entry is checked against the file's size once here, so a lookup never reads past the mapping (a copy cut short, say a push stopped outside porter, would fault there)
+// Validate only the index before publishing pointers into the mapping. Payloads
+// and reflection headers stay untouched until their shader is requested.
 void vk_shaders_open(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
-    if (fd < 0 || fstat(fd, &st)) { VKLOG("[RED] no shader bundle at %s: nothing will be drawn", path); if (fd >= 0) close(fd); return; }
+    if (fd < 0 || fstat(fd, &st)) { if (getenv("DM_GL_ACTIVE")) VKLOG("no shader bundle at %s: an OpenGL ES game (gl_android.c) needs none", path);
+                                    else VKLOG("[RED] no shader bundle at %s: nothing will be drawn", path); if (fd >= 0) close(fd); return; }
     const uint8_t *b = st.st_size >= 12 ? mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED; close(fd);
     if (b == MAP_FAILED || memcmp(b, "DMSV", 4)) { VKLOG("[RED] %s is not a shader bundle", path); if (b != MAP_FAILED) munmap((void *)b, (size_t)st.st_size); return; }
     uint32_t ver, n, nz = 0, bad = 0; memcpy(&ver, b + 4, 4); memcpy(&n, b + 8, 4); const bent *t = (const bent *)(b + 12); uint64_t sz = (uint64_t)st.st_size, raw = 0, stored = 0;
     if (ver < 1 || ver > 2) { VKLOG("[RED] %s: shader bundle version %u, this host reads 1 and 2: nothing will be drawn", path, ver); munmap((void *)b, (size_t)sz); return; }
-    if (12 + 32ull * n > sz) bad = n;
+    uint64_t table_end = 12 + 32ull * n;
+    if (table_end > sz) bad = 1;
     else for (uint32_t i = 0; i < n; i++) { const bent *e = &t[i];
-        bad += (uint64_t)e->spv_off + e->spv_len > sz || (uint64_t)e->refl_off + e->refl_len > sz || e->refl_len < 20;
+        if (e->stage > 5 || (i && e->key <= t[i - 1].key) || (ver == 1 && e->spv_size) ||
+            e->spv_off < table_end || (uint64_t)e->spv_off + e->spv_len > sz ||
+            e->refl_off < table_end || (uint64_t)e->refl_off + e->refl_len > sz || e->refl_len < 20) { bad++; continue; }
         raw += e->spv_size ? e->spv_size : e->spv_len; stored += e->spv_len; nz += e->spv_size != 0; }
-    if (bad) { VKLOG("[RED] %s: %u of its %u shaders lie past the end of the file (%llu bytes), a partial copy: nothing will be drawn", path, bad, n, (unsigned long long)sz); munmap((void *)b, (size_t)sz); return; }
+    if (bad) { VKLOG("[RED] %s: invalid shader index (%u bad records, %u shaders, %llu bytes): nothing will be drawn", path, bad, n, (unsigned long long)sz); munmap((void *)b, (size_t)sz); return; }
     g_bundle = b; g_nent = n; g_ent = t;
     VKLOG("shader bundle %s: version %u, %u shaders (%u zstd-compressed), %.1f MB; SPIR-V %.1f MB stored, %.1f MB decompressed", path, ver, n, nz, sz / 1048576.0, stored / 1048576.0, raw / 1048576.0);
 }
@@ -75,6 +81,15 @@ static uint32_t *bundle_spv(const bent *e, uint32_t *nw) {
     else if (ZSTD_isError(r)) snprintf(why, sizeof why, "its SPIR-V does not decompress (zstd error %d, zstd_errors.h)", (int)ZSTD_getErrorCode(r));
     else if (r != n) snprintf(why, sizeof why, "its SPIR-V decompresses to %zu bytes, its entry says %u", r, n);
     else if (w[0] != 0x07230203) snprintf(why, sizeof why, "not SPIR-V (first word %#x)", w[0]);
+    else if (w[4]) snprintf(why, sizeof why, "invalid SPIR-V schema %u", w[4]);
+    else if (w[1] < 0x10000 || w[1] > 0x10300 || (w[1] & 0xff)) snprintf(why, sizeof why, "unsupported SPIR-V version %#x", w[1]);
+    // Our translator emits SPIR-V 1.3 for Vulkan 1.1; check framing before any
+    // runtime patcher walks instructions. This is not semantic spirv-val.
+    if (!*why) for (uint32_t at = 5; at < n / 4;) {
+        uint32_t count = w[at] >> 16;
+        if (!count || count > n / 4 - at) { snprintf(why, sizeof why, "invalid SPIR-V instruction at word %u", at); break; }
+        at += count;
+    }
     if (*why) { VKLOG("[RED] shader %016llx: %s: left out as if missing", (unsigned long long)e->key, why); free(w); return NULL; }
     *nw = n / 4; return w;
 }
@@ -272,11 +287,16 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
     pthread_mutex_lock(&g_sh_mu);
     if ((s = nvn_hm_get(&g_shaders, &hk))) { pthread_mutex_unlock(&g_sh_mu); free(w); return s == (void *)1 ? NULL : s; }   // another thread made it meanwhile
     if (!w) { nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
-    s = calloc(1, sizeof *s); s->key = key; s->stage = stage; s->set = set_of(stage);
     // reflection
     const uint8_t *r = g_bundle + e->refl_off; uint32_t hdr[5]; memcpy(hdr, r, 20);
+    // Counts must fit this record, not merely the mapped file; widen before multiplying.
+    if (20 + 20ull * hdr[0] + hdr[1] > e->refl_len) {
+        VKLOG("[RED] shader %016llx: reflection exceeds its record: left out as if missing", (unsigned long long)key);
+        free(w); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL;
+    }
+    s = calloc(1, sizeof *s); s->key = key; s->stage = stage; s->set = set_of(stage);
     s->nbind = (int)hdr[0]; s->c1_len = hdr[1]; memcpy(s->local, hdr + 2, 12);
-    s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + 20 * s->nbind;
+    s->b = (const dmsv_bind *)(r + 20); s->c1 = r + 20 + (size_t)20 * s->nbind;
     // SPIR-V with the stage's set
     int f64_used = 0; uint32_t xb = 4;
     for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n) break; if (op == 71 && n >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set;   // OpDecorate DescriptorSet
@@ -306,6 +326,12 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
                        (op == 10 && !memcmp(&w[i + 1], "SPV_EXT_fragment_shader_interlock", 33));
             if (drop) i += n; else for (uint32_t k = 0; k < n; k++) w[o++] = w[i++]; }
         nw = o; } }
+    // DM_VK_UBO_COMPONENT=1 (start-up; a game profile's android.tsv env row): fragment shaders' uniform buffer loads that pick a vector component at a run-time
+    // index load the whole vector and take the component with OpVectorExtractDynamic (gfx_vk_ubo_comp.c). Turnip (Mesa, vulkan.ad07xx.so) did not give each
+    // invocation its own component: Pokémon Violet's lighting drew hair white in waves that also held skin
+    { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_UBO_COMPONENT"); on = e && atoi(e); if (on) VKLOG("shaders: uniform buffer components at run-time indices taken from the loaded vector in fragment shaders (DM_VK_UBO_COMPONENT)"); }
+      uint32_t n2 = 0, sites = 0, *w2 = on && stage == 1 ? spv_ubo_component(w, nw, &n2, &sites) : NULL;
+      if (w2) { free(w); w = w2; nw = n2; VKLOG("shader %016llx: %u uniform buffer components at run-time indices taken from the loaded vector (DM_VK_UBO_COMPONENT)", (unsigned long long)key, sites); } }
     // subgroup operations of a class the stage lacks (not in supportedStages, VUID-RuntimeSpirv-None-06343; a class not in supportedOperations; quad operations outside
     // fragment and compute without quadOperationsInAllStages, -06342): the module runs as subgroups of one invocation (gfx_vk_subgroup.c). On a Retroid Pocket 5
     // (Adreno 650, Turnip: compute alone) Pokemon Pokopia's fragment shader 541aa7b27f1fae4d, the translator's SHFL helper, lost the device at the title screen.
@@ -317,6 +343,18 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
       if (w2) { free(w); w = w2; nw = n2; VKLOG("shader %016llx (stage %d): subgroups of one invocation (the device's subgroup operations in this stage: %#x)", (unsigned long long)key, stage, ops); }
       else if (why[0]) VKLOG("[RED] shader %016llx (stage %d) uses subgroup operations the device lacks in this stage (it has %#x), and %s is not covered by the one-invocation rewrite: left as it is", (unsigned long long)key, stage, ops, why); }
     if (stage == 0) { uint32_t n2 = 0, *w2 = spv_vs_init(w, nw, &n2); if (w2) { free(w); w = w2; nw = n2; } }
+    // Maxwell's FMNMX returns the operand that is a number when the other is NaN, and its saturate turns NaN into 0 (IEEE minNum / maxNum, as Metal's fmin / fmax).
+    // The translator emits GLSL.std.450 FMin / FMax / FClamp, whose result is undefined for a NaN operand, and Adreno passes the NaN on: their NaN-aware forms NMin /
+    // NMax / NClamp give Maxwell's results. Xenoblade Chronicles 3's fur pixel shaders (4fd6e9e891e821cf, f8cc7339c930dc07) take max(0, sqrt(1 - x² - y²)) of
+    // their fur direction texels; where x² + y² is just over 1 the NaN went through, the whole fur vector became NaN and its saturate 0, which the motion blur
+    // reads as full speed down-left: the Nopons' fur smeared over their faces (the Mac and Eden: clean). DM_VK_NAN_MINMAX=0 (start-up, A/B): as translated
+    { static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_NAN_MINMAX"); on = !(e && !strcmp(e, "0")); }
+      uint32_t glsl = 0;
+      for (uint32_t i = 5; on && i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) break;
+          if (op == 11 && n >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];   // OpExtInstImport
+          else if (op == 12 && n >= 5 && glsl && w[i + 3] == glsl) { uint32_t *x = &w[i + 4];   // OpExtInst: FMin 37 → NMin 79, FMax 40 → NMax 80, FClamp 43 → NClamp 81
+              if (*x == 37) *x = 79; else if (*x == 40) *x = 80; else if (*x == 43) *x = 81; }
+          i += n; } }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
@@ -454,6 +492,40 @@ static uint32_t *spv_frag_depth(const uint32_t *w, uint32_t nw, uint32_t *onw) {
         memcpy(&o[no], &w[i], n * 4); no += n; i += n; }
     o[3] = c.bound; *onw = no; free(c.nt); return o;
 }
+// Separate only GS buffer effects that do not drive its rasterization. User UBOs
+// and textures could alias a written buffer, so this first path accepts only the
+// host's immutable driver/support/constant segments and direct storage buffers.
+int vk_shader_gs_split_ready(vkshader_t *s) {
+    if (!s || s->stage != 2 || s->xfb || !s->spv || !V.has_gs_pointsize) return 0;
+    pthread_mutex_lock(&g_sh_mu);
+    if (s->gs_split) { int ok = s->gs_split == 1; pthread_mutex_unlock(&g_sh_mu); return ok; }
+    s->gs_split = 2;
+    for (int i = 0; i < s->nbind; i++) {
+        int k = s->b[i].kind;
+        if (k != RK_SUPPORT && k != RK_DRV && k != RK_C1 && k != RK_SBUF) { pthread_mutex_unlock(&g_sh_mu); return 0; }
+    }
+    uint32_t nr = 0, ne = 0, *r = NULL, *e = NULL; char why[128];
+    r = spv_gs_split(s->spv, s->nspv, 2, &nr, why, sizeof why);
+    if (r) e = spv_gs_split(s->spv, s->nspv, 1, &ne, why, sizeof why);
+    if (e) {
+        // Adreno's GS subgroup includes the physical output-vertex threads. Run
+        // guest warp scalarization in singleton groups in the effects pass.
+        uint32_t nn = 0, *one = spv_one_lane(e, ne, 0, &nn, why, sizeof why);
+        if (one) { free(e); e = one; ne = nn; }
+        else if (why[0]) { free(e); e = NULL; }
+    }
+    if (e && r) {
+        VkShaderModuleCreateInfo ei = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)ne * 4, e};
+        VkShaderModuleCreateInfo ri = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nr * 4, r};
+        VkResult a = vkCreateShaderModule(V.dev, &ei, NULL, &s->gs_mod[0]);
+        VkResult b = a ? a : vkCreateShaderModule(V.dev, &ri, NULL, &s->gs_mod[1]);
+        if (!a && !b) { s->gs_split = 1; VKLOG("geometry shader %016llx: buffer effects separated from rasterization", (unsigned long long)s->key); }
+        else { if (s->gs_mod[0]) vkDestroyShaderModule(V.dev, s->gs_mod[0], NULL); if (s->gs_mod[1]) vkDestroyShaderModule(V.dev, s->gs_mod[1], NULL); s->gs_mod[0] = s->gs_mod[1] = VK_NULL_HANDLE; }
+    }
+    free(e); free(r); int ok = s->gs_split == 1;
+    pthread_mutex_unlock(&g_sh_mu); return ok;
+}
+
 // DM_VK_SPV_DIR=<dir> with DM_VK_SPV_ALT=1 (live, debugging): pipelines made while it is on use <dir>/<key>.spv in place of the bundle's code where the file
 // exists (same bindings), so two compilations of a shader can be compared in one run: the translator's module through spirv-opt, its GLSL through glslc...
 static VkShaderModule alt_module(vkshader_t *s) {
@@ -484,20 +556,20 @@ static uint32_t *spv_dual(const uint32_t *w, uint32_t nw, uint32_t *onw) {
     memcpy(&o[at + 8], &w[at + 4], (size_t)(nw - at - 4) * 4); *onw = nw + 4;
     return o;
 }
-static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);
-VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
-    VkShaderModule m = vk_shader_module_(s, um, im, xo, fd); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[3] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return m; }
-static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) {
+static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vi);
+VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vi) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
+    VkShaderModule m = vk_shader_module_(s, um, im, xo, fd, vi); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[3] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return m; }
+static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vi) {
     int dual = fd >> 1 & 1; fd &= 1;   // fd bit 1: the dual-source variant
     if (fd && (s->stage != 1 || s->depth_repl)) fd = 0;
     if (dual && s->stage != 1) dual = 0;
-    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual) || !s->spv) return s->mod;
+    if (!(um | im | xo | (uint64_t)fd | (uint64_t)dual | vi) || !s->spv) return s->mod;
     if (xo == 1u << 31) {   // DM_VK_SPV_ALT
         pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
         VkShaderModule m = alt_module(s); if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){0, 0, xo, 0, m}; pthread_mutex_unlock(&g_sh_mu); return m; }
     xo &= ~(1u << 31);
     pthread_mutex_lock(&g_sh_mu);
-    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1)) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
+    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1) && s->var[i].vi == vi) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
     uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
@@ -505,18 +577,19 @@ static VkShaderModule vk_shader_module_(vkshader_t *s, uint64_t um, uint64_t im,
         if (w && s->stage == 0) { uint32_t n3 = 0, *w3 = spv_vs_init(w, nw, &n3); if (w3) { free(w); w = w3; nw = n3; } } }   // the added outputs start as (0, 0, 0, 1) too
     if (fd && (w || !(nb || xo))) { uint32_t n2 = 0, *w2 = spv_frag_depth(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
     if (dual && (w || !(nb || xo || fd))) { uint32_t n2 = 0, *w2 = spv_dual(w ? w : s->spv, nw, &n2); free(w); w = w2; nw = n2; }
+    if (vi) { uint32_t n2 = 0, *w2 = spv_vertex_signedness(w ? w : s->spv, nw, vi, &n2); free(w); w = w2; nw = n2; }
     if (w) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual); }
         else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, dual source %d", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
         free(w); }
     else VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d, dual source %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, dual);
-    if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fd | dual << 1, m};
+    if (s->nvar < 8) s->var[s->nvar++] = (typeof(s->var[0])){um, im, xo, fd | dual << 1, m, vi};
     pthread_mutex_unlock(&g_sh_mu);
     return m;
 }
-// static buffers: Ryujinx's support buffer (render scales 1.0, nothing else set: as nvn_mtl.m support_buf) and 64 KB of zeros (unbound uniform slots, driver segments nobody reads)
+// Static support, zero and disabled-attribute buffers. Maxwell supplies (0,0,0,1) for disabled generic attributes; its register words are float bit patterns even when a shader reads them as integers.
 static VkBuffer static_buf(int which) {
-    static VkBuffer b[2]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static VkBuffer b[3]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     { VkBuffer r = __atomic_load_n(&b[which], __ATOMIC_ACQUIRE); if (r) return r; }   // made already: no lock (every draw binds them)
     pthread_mutex_lock(&mu);
     if (!b[which]) {
@@ -526,6 +599,7 @@ static VkBuffer static_buf(int which) {
         VkDeviceMemory m; VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, nb, m, 0));
         void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); memset(p, 0, 65536);
         if (which == 0) for (int i = 0; i < 73; i++) *(float *)((uint8_t *)p + 192 + 16 * i) = 1.0f;   // render_scale[i].x (SupportBuffer.cs layout)
+        if (which == 2) ((float *)p)[3] = 1.0f;   // Odyssey's depth pre-pass reads an absent attribute's .w as its flower displacement weight; zero disagrees with the material pass and leaves stale colour.
         __atomic_store_n(&b[which], nb, __ATOMIC_RELEASE);   // published once filled
     }
     pthread_mutex_unlock(&mu);
@@ -533,6 +607,7 @@ static VkBuffer static_buf(int which) {
 }
 VkBuffer vk_support_buffer(void) { return static_buf(0); }
 VkBuffer vk_zero_buffer(void) { return static_buf(1); }
+VkBuffer vk_default_attribute_buffer(void) { return static_buf(2); }
 // a shader's c1 constants: copied once into a buffer of their own (the bundle bytes do not change; the reflection is never compressed)
 void vk_shader_c1(vkshader_t *s, VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *len) {
     if (!s->c1_len) { *buf = vk_zero_buffer(); *off = 0; *len = 65536; return; }

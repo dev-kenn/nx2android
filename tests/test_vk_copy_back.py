@@ -6,6 +6,9 @@ import tempfile
 import unittest
 
 from porter.toolchain import find_ndk
+import sys; sys.path.insert(0, str(Path(__file__).resolve().parent))
+import host_cc   # noqa: E402
+import csrc  # noqa: E402
 
 
 class CopyBack(unittest.TestCase):
@@ -16,8 +19,7 @@ class CopyBack(unittest.TestCase):
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
         core = (Path(__file__).resolve().parents[1] / 'nxnative/dm/android/gfx_vk_core.c').read_text()
-        start = core.index('static void pools_readback_barrier(VkCommandBuffer cb) {')
-        function = core[start:core.index('\n}\n', start)+3]
+        function = csrc.function(core, 'static void pools_readback_barrier(VkCommandBuffer cb) {')
         harness = r'''
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
@@ -47,20 +49,20 @@ int main(void) {
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-idirafter', str(headers), str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
 
-    @unittest.skipUnless(shutil.which('cc'), 'a host C compiler is required')
+    @unittest.skipUnless(host_cc.posix(), 'a POSIX host C compiler is required (<sys/mman.h>, pthread, setenv)')
     def test_protected_pools(self):
         dm = Path(__file__).resolve().parents[1] / 'nxnative/dm'
         dirty = (dm / 'gfx/nvn/nvn_dirty.c').read_text()
         dirty = '\n'.join(s for s in dirty.splitlines() if not s.startswith('#include'))
         core = (dm / 'android/gfx_vk_core.c').read_text()
         start = core.index('static void pools_copy_back(const struct vksub *s) {')
-        copy_back = core[start:core.index('\n}\n', start) + 3]
+        copy_back = csrc.function(core, 'static void pools_copy_back(const struct vksub *s) {')
         if 'static uint64_t pool_merge_back(' in core:
             copy_back = core[core.index('static uint64_t pool_merge_back('):start] + copy_back
         start = core.index('static void vk_pools_sync_(VkCommandBuffer cb) {')
-        sync = core[start:core.index('\n}\n', start) + 3]
-        start = core.index('static void pool_cache_sync(')
-        cache_sync = core[start:core.index('\n}\n', start) + 3]
+        sync = csrc.function(core, 'static void vk_pools_sync_(VkCommandBuffer cb) {')
+        cache_sync = csrc.function(core, 'static void pool_cache_sync(')
+        dc_cvac = csrc.function(core, 'static void dc_cvac_range(')
         harness = r'''
 #define _GNU_SOURCE
 #include <assert.h>
@@ -98,7 +100,7 @@ static int checked_mprotect(void *a, size_t n, int prot) {
 }
 #define mprotect checked_mprotect
 DIRTY
-typedef struct { uint64_t lo, hi, mem; uint8_t *shadow; int synced, flags, baseline_complete, noncoherent; uint8_t *baseline; uint64_t stamp, stamp0; const void *span; } vkpool_t;
+typedef struct { uint64_t lo, hi, mem; uint8_t *shadow; int synced, flags, baseline_complete, noncoherent, zero_copy; uint8_t *baseline; uint64_t stamp, stamp0; const void *span; } vkpool_t;
 static vkpool_t g_pool[5]; static int g_npool = 5;
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
 struct vksub { struct { uint64_t lo, hi; } gw[2]; int ngw, readback_ranges; };
@@ -120,7 +122,7 @@ typedef struct { int sType; const void *pNext; uint64_t memory, offset, size; } 
 #define VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE 6
 #define VK_WHOLE_SIZE UINT64_MAX
 #define VKCHK(x) do { if ((x)<0) _exit(88); } while (0)
-static struct { int dev; struct { struct { uint64_t nonCoherentAtomSize; } limits; } props; } V;
+static struct { int dev; struct { struct { uint64_t nonCoherentAtomSize; } limits; uint32_t vendorID; } props; } V;
 static uint8_t *device_data;
 static int flushes, invalidates, cache_failure;
 static uint64_t last_flush_offset, last_flush_size, last_invalidate_offset, last_invalidate_size;
@@ -148,7 +150,9 @@ static void *snapshot_memcpy(void *dst, const void *src, size_t n) {
     if (b && a>=b && a-b<g_pool[0].hi-g_pool[0].lo) snapshot_bytes+=n;
     return memcpy(dst,src,n);
 }
+#undef memcpy // macOS headers may provide a fortified memcpy macro
 #define memcpy snapshot_memcpy
+DC_CVAC
 SYNC
 #undef memcpy
 COPY_BACK
@@ -157,15 +161,33 @@ static void handle_fault(int sig, siginfo_t *info, void *uc) {
     if (++calls > 32) _exit(77); // bound the old repeated-fault failure
     (void)sig; if (!fault_hook(info->si_addr, 1, uc)) _exit(99);
 }
-static pthread_barrier_t cpu_start, cpu_done;
+// A reusable two-thread rendezvous; macOS has no pthread_barrier_t.
+typedef struct { pthread_mutex_t mu; pthread_cond_t cv; unsigned waiting, generation; } test_barrier_t;
+#define TEST_BARRIER_INIT { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0 }
+static test_barrier_t cpu_start = TEST_BARRIER_INIT, cpu_done = TEST_BARRIER_INIT;
+static void test_barrier_wait(test_barrier_t *b) {
+    assert(!pthread_mutex_lock(&b->mu));
+    unsigned generation = b->generation;
+    if (++b->waiting == 2) {
+        b->waiting = 0; b->generation++;
+        assert(!pthread_cond_broadcast(&b->cv));
+    } else {
+        while (generation == b->generation) assert(!pthread_cond_wait(&b->cv, &b->mu));
+    }
+    assert(!pthread_mutex_unlock(&b->mu));
+}
+static void test_barrier_destroy(test_barrier_t *b) {
+    assert(!pthread_cond_destroy(&b->cv)); assert(!pthread_mutex_destroy(&b->mu));
+}
 static void *cpu_writer(void *arg) {
     volatile uint8_t *mem = arg;
-    for (int i=0;i<8;i++) { pthread_barrier_wait(&cpu_start); mem[16]=(uint8_t)(9+i); pthread_barrier_wait(&cpu_done); }
+    for (int i=0;i<8;i++) { test_barrier_wait(&cpu_start); mem[16]=(uint8_t)(9+i); test_barrier_wait(&cpu_done); }
     return NULL;
 }
 int main(int argc, char **argv) {
     struct sigaction sa = {.sa_sigaction = handle_fault, .sa_flags = SA_SIGINFO};
     sigemptyset(&sa.sa_mask); assert(sigaction(SIGSEGV, &sa, NULL) == 0);
+    assert(sigaction(SIGBUS, &sa, NULL) == 0); // macOS reports protected-page writes as SIGBUS
     size_t pg = (size_t)getpagesize(), size = pg * (argc>1 && atoi(argv[1])>=10 ? 40 : 4);
     uint8_t *mem = mmap(NULL, size * 5, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(mem != MAP_FAILED); memset(mem, 11, size * 5);
@@ -174,6 +196,20 @@ int main(int argc, char **argv) {
         uint8_t *baseline = malloc(size); assert(baseline); memset(baseline, 11, size);
         g_npool = 1; g_pool[0] = (vkpool_t){.lo=(uintptr_t)mem, .hi=(uintptr_t)(mem + size), .shadow=shadow, .synced=1, .baseline=baseline};
         int mode = atoi(argv[1]);
+        if (mode == 20) {
+            // A zero-copy pool on a Mali device (vendor 0x13b5): its dirty bytes are cleaned in place, with no
+            // shadow and no baseline copy; on a coherent GPU (Adreno, 0x5143) nothing is flushed at all.
+            // `dc cvac` is a no-op on a host that is not aarch64, so the accounting is what this case observes.
+            g_pool[0] = (vkpool_t){.lo=(uintptr_t)mem, .hi=(uintptr_t)(mem + size), .shadow=NULL, .baseline=NULL, .zero_copy=1};
+            V.props.vendorID = 0x5143; g_sync_bytes = 0;
+            vk_pools_sync_(NULL);
+            assert(g_sync_bytes == 0);            // a coherent GPU needs no cache maintenance
+            V.props.vendorID = 0x13b5; g_sync_bytes = 0;
+            vk_pools_sync_(NULL);
+            assert(g_sync_bytes == size);         // untracked pool: the whole of it, once
+            assert(g_pool[0].baseline == NULL);   // a zero-copy pool never allocates a baseline
+            return 0;
+        }
         if (mode == 8) {
             // Untracked/unaligned pools, partial final blocks, overlapping ranges and untouched guard bytes.
             for (size_t round = 0; round < 200; round++) {
@@ -339,16 +375,15 @@ int main(int argc, char **argv) {
                 free(baseline); free(shadow); assert(!munmap(mem,size*5)); return 0;
             }
             if (mode == 9) {
-                assert(!pthread_barrier_init(&cpu_start,NULL,2) && !pthread_barrier_init(&cpu_done,NULL,2));
                 pthread_t cpu; assert(!pthread_create(&cpu,NULL,cpu_writer,mem));
                 struct vksub s = {0};
                 for (int i=0;i<8;i++) {
                     if (i) vk_pools_sync_(NULL);
-                    pthread_barrier_wait(&cpu_start); pthread_barrier_wait(&cpu_done);
+                    test_barrier_wait(&cpu_start); test_barrier_wait(&cpu_done);
                     shadow[0]=(uint8_t)(31+i); pools_copy_back(&s);
                     assert(mem[0]==(uint8_t)(31+i) && mem[16]==(uint8_t)(9+i));
                 }
-                assert(!pthread_join(cpu,NULL)); pthread_barrier_destroy(&cpu_start); pthread_barrier_destroy(&cpu_done);
+                assert(!pthread_join(cpu,NULL)); test_barrier_destroy(&cpu_start); test_barrier_destroy(&cpu_done);
                 free(baseline); free(shadow); assert(!munmap(mem,size*5)); return 0;
             }
             // CPU changes bytes the GPU does not write, including bytes in the same cache line.
@@ -411,14 +446,14 @@ int main(int argc, char **argv) {
     assert(munmap(mem, size * 5) == 0);
     return 0;
 }
-'''.replace('DIRTY', dirty).replace('CACHE_SYNC', cache_sync).replace('SYNC', sync).replace('COPY_BACK', copy_back)
+'''.replace('DIRTY', dirty).replace('CACHE_SYNC', cache_sync).replace('DC_CVAC', dc_cvac).replace('SYNC', sync).replace('COPY_BACK', copy_back)
         with tempfile.TemporaryDirectory(prefix='nx2a-copyback-') as tmp:
             c, exe = Path(tmp) / 'check.c', Path(tmp) / 'check'
             c.write_text(harness)
             subprocess.run(['cc', '-std=gnu11', '-pthread', '-Wall', '-Wextra', '-Werror',
                             '-Wno-misleading-indentation', str(c), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True, timeout=15)
-            for case in ('4', '5', '6', '7', '8', '9', '10', '11', '12', '15', '16', '17', '18', '19'):
+            for case in ('4', '5', '6', '7', '8', '9', '10', '11', '12', '15', '16', '17', '18', '19', '20'):
                 subprocess.run([str(exe), case], check=True, timeout=15)
             for case in ('13', '14'):
                 result = subprocess.run([str(exe), case], capture_output=True, text=True, timeout=15)

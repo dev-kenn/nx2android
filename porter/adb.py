@@ -1,6 +1,6 @@
 # adb for installing a port: the device list, installing the APK, and pushing the data pack in short transfers. Big pushes over one adb connection wedge adbd on some
 # devices (a 6 GB RomFS), so small files go in batches (tar archives of up to 64 MB when there are many) and big files in 64 MB pieces that the device joins; a rerun resumes (files already at their size are skipped,
-# pieces already in place are kept). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
+# pieces are kept if their checksums match). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
 # reached the device until they were. Pushes use -Z: compressing them took adbd down.
 import contextlib, hashlib, os, re, shlex, shutil, subprocess, tarfile, tempfile, time
 from pathlib import Path
@@ -14,6 +14,7 @@ NO_ADB = 'adb not found: install Android platform-tools (Download missing tools)
 
 
 LONG_PATH = 240   # adb.exe is not long-path aware: it cannot open a file whose full path passes Windows' 260 characters (Viractal's Unity bundles in a deep game folder)
+HOLD_POLL = 1.0   # s between tries while another install holds the device (Adb.hold)
 TAR_MIN, TAR_FILES, TAR_BYTES = 256, 8192, 64 << 20   # push_tree: from this many small files on, tar archives of at most this many files / bytes
 
 
@@ -109,6 +110,19 @@ class Adb:
         out = self.shell('for p in ' + ' '.join(shlex.quote(x) for x in (a, b)) + '; do while [ ! -e "$p" ]; do p=$(dirname "$p"); done; stat -L -c %d "$p"; done', check=False).split()
         return len(out) == 2 and out[0] == out[1]
 
+    def sd_volume(self):
+        """The SD card's mount folder (/storage/<its id>), None when no portable volume is mounted. sm lists a mounted public volume as "public:179,1 mounted 0AEF-0B2F":
+        179 is the MMC block major (an SD card), so such a volume comes first; a USB drive on OTG (major 8) only when no SD card is mounted"""
+        vols = []
+        for ln in self.shell('sm list-volumes', check=False).splitlines():
+            p = ln.split()
+            if len(p) >= 3 and p[0].startswith('public:') and p[1] == 'mounted' and re.fullmatch(r'[A-Za-z0-9-]+', p[2]) and p[2] != 'null':
+                vols.append((not p[0].startswith('public:179,'), f'/storage/{p[2]}'))
+        return sorted(vols, key=lambda v: v[0])[0][1] if vols else None   # stable: the first listed of each kind
+
+    def is_dir(self, path):   # whether path is a folder on the device
+        return self.shell(f'[ -d {shlex.quote(path)} ] && echo yes; true', check=False).strip() == 'yes'
+
     def read_text(self, path):   # a small text file on the device, '' when it is not there
         return self.shell(f'cat {shlex.quote(path)} 2>/dev/null; true', check=False)
 
@@ -164,6 +178,41 @@ class Adb:
             self.run('uninstall', package, timeout=300, retries=1)
             self.run('install', apk, timeout=600, retries=1)
 
+    def start_app(self, package):
+        """Start the installed package's launcher, including optional Java activities and older ports."""
+        out = self.shell(f'cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {shlex.quote(package)}')
+        components = [ln.strip() for ln in out.splitlines() if re.fullmatch(re.escape(package) + r'/[A-Za-z_.$][A-Za-z0-9_.$]*', ln.strip())]
+        if len(components) != 1:
+            raise AdbError(f'{package}: cannot resolve its launcher activity: {out.strip()}')
+        out = self.shell(f'am start -W -n {shlex.quote(components[0])} 2>&1', timeout=60)
+        if re.search(r'(?im)^(?:Error|Exception)', out):
+            raise AdbError(f'{package}: could not start its launcher activity: {out.strip()}')
+
+    def hold(self, folder, wait=True):
+        """One porter install per device at a time (two at once on one device uninstalled each other's app, and Android deleted the data and the saves with it): a lock
+        file per serial in folder, held until the returned file is closed (the system also drops it when a crashed or killed install exits). While another install
+        holds it: a message, then wait for it (wait=False: AdbError). None (no lock) on a system with neither flock nor msvcrt.locking"""
+        try: import fcntl
+        except ImportError: fcntl = None
+        try: import msvcrt
+        except ImportError: msvcrt = None
+        if not fcntl and not msvcrt: return None
+        f = open(Path(folder) / ('install-' + re.sub(r'[^A-Za-z0-9._-]', '_', self.serial or 'device') + '.lock'), 'w')
+        def take():   # True when f now holds the lock
+            try:
+                if fcntl: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else: f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)   # byte 0; Windows drops it when the handle closes or the process exits
+                return True
+            except OSError: return False
+        try:
+            if not take():
+                name = self.serial or 'the device'
+                if not wait: raise AdbError(f'another porter install is using {name}: wait for it to end')
+                self.log(f'another porter install is using {name}: waiting for it to end')
+                while not take(): time.sleep(HOLD_POLL)
+        except BaseException: f.close(); raise
+        return f
+
     def prepare_app_files(self, package, timeout=30):
         """Have Android create the app's files folder (/sdcard/Android/data/<package>/files) before anything is pushed into it: the system makes it, owned by the app with
         the app's group, when the app first asks for it. A folder the shell makes first lacks that group underneath FUSE, and the app cannot read what is pushed below it
@@ -181,7 +230,7 @@ class Adb:
             if isdir(old): raise AdbError(f'{files} needs to be made again by the app, but {old} is already there (left by an earlier repair): move what you need out of it and delete it')
             self.log(f'{files} belongs to uid {owner}, not to the app (uid {uid}): letting the app make it again and moving its contents back in')
             self.shell(f'mv {shlex.quote(files)} {shlex.quote(old)}')
-        self.shell(f'am start -W -n {package}/android.app.NativeActivity >/dev/null 2>&1; true', timeout=60)
+        self.start_app(package)
         for _ in range(timeout * 2):
             if isdir(files): break
             time.sleep(0.5)
@@ -225,10 +274,10 @@ class Adb:
             if sz.isdigit(): have[name[2:] if name.startswith('./') else name] = int(sz)
         return have
 
-    def remote_md5(self, rdir, rels):   # {relative path: MD5} of those files under rdir (missing ones left out)
+    def remote_md5(self, rdir, rels, **kw):   # {relative path: MD5} of those files under rdir (missing ones left out)
         out, q = {}, shlex.quote(rdir)
         for i in range(0, len(rels), 64):
-            for ln in self.shell(f'cd {q} && md5sum ' + ' '.join(shlex.quote(r) for r in rels[i:i + 64]) + ' 2>/dev/null; true').splitlines():
+            for ln in self.shell(f'cd {q} && md5sum ' + ' '.join(shlex.quote(r) for r in rels[i:i + 64]) + ' 2>/dev/null; true', **kw).splitlines():
                 h, _, name = ln.partition('  ')
                 if len(h) == 32: out[name] = h
         return out
@@ -293,19 +342,38 @@ class Adb:
         return done
 
     def push_file(self, local, dst, chunk=64 << 20, progress=None):
-        """One file in pieces of chunk bytes, joined on the device; pieces already there are kept, so an interrupted push resumes. progress(done, size, note)"""
+        """One file in pieces of chunk bytes, joined on the device; matching pieces are kept after checking their MD5, so an interrupted push resumes. progress(done, size, note)"""
         local = Path(local); size = local.stat().st_size; n = max(1, (size + chunk - 1) // chunk)
         pdir = f'{os.path.dirname(dst)}/.dmpart-{hashlib.sha1(dst.encode()).hexdigest()[:12]}'   # one piece folder per file: a resumed push finds its own pieces
         self.shell(f'mkdir -p {shlex.quote(pdir)}'); pieces = self.remote_sizes(pdir)
+        same = [f'{k:05d}' for k in range(n) if pieces.get(f'{k:05d}') == min(chunk, size - k * chunk)]
+        md5 = {}
+        batch = max(1, min(8, (256 << 20) // chunk))
+        for i in range(0, len(same), batch):
+            try:
+                md5.update(self.remote_md5(pdir, same[i:i + batch], timeout=min(self.timeout, 120), retries=1))
+            except AdbError as e:
+                self.log(f'{local.name}: could not verify retained pieces ({e}); sending the unverified pieces again')
+                break   # a slow device should not pay another checksum timeout for every remaining batch
         with tempfile.TemporaryDirectory(prefix='nx2a_push_') as t, open(local, 'rb') as f:
             for k in range(n):
                 want, name = min(chunk, size - k * chunk), f'{k:05d}'
-                if pieces.get(name) != want:
+                f.seek(k * chunk); data = f.read(want)
+                if len(data) != want: raise AdbError(f'{local.name}: source changed during the push (short read); try again')
+                if pieces.get(name) != want or md5.get(name) != hashlib.md5(data).hexdigest():
                     tmp = Path(t) / 'piece.bin'
-                    f.seek(k * chunk); tmp.write_bytes(f.read(want))
+                    tmp.write_bytes(data)
                     self.run('push', '-Z', tmp, f'{pdir}/{name}', timeout=max(self.timeout, 600))
+                del data
                 if progress: progress(k * chunk + want, size, f'{local.name} piece {k + 1}/{n}')
+            if os.fstat(f.fileno()).st_size != size: raise AdbError(f'{local.name}: source changed size during the push; try again')
         q, qp = shlex.quote(dst), shlex.quote(pdir)   # join the pieces in order, then check the size
-        self.shell(f'rm -f {q} && for x in $(ls {qp} | sort); do cat {qp}/$x >> {q} || exit 1; done && rm -rf {qp}', timeout=1200)
+        # Join only this source's pieces: a shorter file or a different chunk size may leave old tail pieces in the same folder.
+        for i in range(0, n, 256):   # keep each command short even when there are many pieces
+            names = ' '.join(f'{k:05d}' for k in range(i, min(i + 256, n)))
+            start = f'rm -f {q} && ' if i == 0 else ''
+            # Retrying an interrupted append could duplicate data; a later push starts the join over.
+            self.shell(f'{start}(cd {qp} && cat {names}) >> {q}', timeout=1200, retries=1)
         got = self.shell(f'stat -c %s {q}').strip()
         if got != str(size): raise AdbError(f'{local.name}: {got} bytes on the device, expected {size}')
+        self.shell(f'rm -rf {qp}')

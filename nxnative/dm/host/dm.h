@@ -1,6 +1,8 @@
 // Common header of the native Switch host (multi-module).
 #pragma once
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +10,12 @@
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
 #define MAX_MOD 128   // the profile's modules (up to 8) and the NROs a game loads at run time (Super Smash Bros. Ultimate: 98)
-#define LOG(...) do { fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+// Seconds since process start, the same origin the fs read log uses (hle_fs.c's g_t0_ns), so log.txt and fslog.tsv line up. g_t0_ns is set once by
+// host_preload; now_ns() is a clock read, where proc_start_mono_ns() on Android walks /proc through the sysctl shim for every line.
+double dm_log_elapsed(void);   // defined in dm/host/main.c
+// One line at a time: LOG is called from guest threads and from the replay/present threads at once, and two stdio calls per line let another
+// thread's text land in the middle of this one. flockfile keeps it whole without formatting into a buffer (a guest thread's stack can be 8 KB)
+#define LOG(...) do { flockfile(stderr); fprintf(stderr, "[dm] %9.3fs ", dm_log_elapsed()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } while (0)
 #define die(...) do { LOG("FATAL " __VA_ARGS__); abort(); } while (0)
 
 // Object-format differences for inline assembly and registration tables (Android port: ELF instead of Mach-O).
@@ -128,6 +135,7 @@ extern struct dm_flags { int thr, svc, fs, movie, dbg, imports, bootprof; } g_fl
 void *objmap_get(const void *guest); void objmap_put(const void *guest, void *host); void *objmap_del(const void *guest);
 void hle_signal_system_event(void *g);   // hle_thread.c: signal a service-layer SystemEvent (any thread)
 void hle_bind_system_event(void *g, int autoclear);   // On a guest thread, bind a guest SystemEvent to a kernel event
+void hle_rebind_system_event(void *g, int autoclear);   // the same, dropping a binding this address had (a struct reused without being destroyed)
 void hle_clear_system_event(void *g);    // hle_thread.c: clear a bound service-layer SystemEvent (any thread)
 int hle_signal_bound_system_event(void *g);   // hle_thread.c: signal a service-layer SystemEvent only if it is bound (any thread); 0 when it is not
 // Page fault hook / hook before the host writes guest memory (crash.c; used for write-protect dirty page tracking)

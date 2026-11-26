@@ -8,14 +8,14 @@ def _parser():
     sub = ap.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('doctor', help='check the tools a port needs'); d.add_argument('--json', action='store_true'); d.add_argument('-k', '--keys')
     p = sub.add_parser('profiles', help='list the games the tool can port'); p.add_argument('--all', action='store_true', help='also the iOS profiles not ported to Android'); p.add_argument('--json', action='store_true')
-    i = sub.add_parser('inspect', help='what a game folder holds and whether it can be ported'); i.add_argument('folder'); i.add_argument('--json', action='store_true')
+    i = sub.add_parser('inspect', help='what a game folder holds and whether it can be ported'); i.add_argument('folder', help="the game's folder, or one dump file (a merged NSP / XCI carries the base game, update and DLC)"); i.add_argument('--json', action='store_true')
     i.add_argument('-k', '--keys', help='prod.keys (default: the configured one): reads the title ID of a dump with no [title ID] in its name')
     po = sub.add_parser('port', help='make the APK and the data pack (and install them)')
-    po.add_argument('folder', help='the game\'s folder: its base game NSP / XCI / NSZ / XCZ, updates and DLC')
+    po.add_argument('folder', help='the game\'s folder, or one dump file: its base game NSP / XCI / NSZ / XCZ, updates and DLC (a merged NSP / XCI carries them all)')
     po.add_argument('-k', '--keys', help='prod.keys (default: the configured one)')
     po.add_argument('-o', '--out', help='folder for the APK and the data pack (default: the game folder)')
     po.add_argument('-p', '--version', default='', help='version to pack, v<N> (default: the newest in the folder)')
-    po.add_argument('-l', '--language', default='', help='game language, a code or a name (default: English)')
+    po.add_argument('-l', '--language', default='', help='game language, a code, a name or system (default: English)')
     po.add_argument('--app-name', default='', help='the app\'s name on the device (default: the game\'s name)')
     po.add_argument('--install', action='store_true', help='install on the connected device afterwards')
     po.add_argument('--device', default='', help='adb serial of the device to install on')
@@ -23,11 +23,15 @@ def _parser():
     po.add_argument('--debug', action='store_true', help='a development build: debug information, debuggable, DM_CTL key presses')
     po.add_argument('--experimental', action='store_true', help='try a game not ported to Android yet (a profile guessed from a survey of its files; it may not start)')
     po.add_argument('--package', default='', help="the app's package instead of the profile's (a test install beside another build of the game)")
+    po.add_argument('--native-keyboard', action='store_true', help='use the Android Unicode keyboard (requires JDK and Android SDK platform/build-tools)')
     po.add_argument('--external-display', action='store_true', help='build the external-screen gamepad activity (requires Android SDK platform and build-tools)')
     po.add_argument('--fps60', action='store_true', help='60 fps: the profile\'s own frame-rate cap, else the community\'s FPSLocker-Warehouse config of the game\'s build, fetched from GitHub')
     po.add_argument('--touch', action='store_true',
                     help='a game played by touch: the on-screen gamepad starts hidden, so every touch but the menu button\'s goes to the game (the pause menu shows it again; '
                          'the first launch\'s default: the app keeps the player\'s own settings)')
+    po.add_argument('--no-menu-button', action='store_true',
+                    help='no on-screen menu button (DM_MENU_BUTTON=0 in env.txt): the Back gesture or key, or a controller\'s Home/Menu key, opens the pause menu; '
+                         'it needs a port again (or env.txt edited) to show the button again')
     po.add_argument('--mt-replay', action='store_true',
                     help='multithread replay: the game\'s Vulkan commands are recorded on a thread of their own (DM_VK_MT_REPLAY=1 in env.txt), for a game whose replay '
                          'thread holds its frame rate back; it needs a port again (or env.txt edited) to turn off')
@@ -37,10 +41,15 @@ def _parser():
                     help='path to a user-supplied Lossless.dll for extracting frame-generation shaders (implies --framegen)')
     po.add_argument('--vulkan-driver', default=None, metavar='FILE',
                     help='an arm64 Vulkan driver library (.so, such as Mesa\'s Turnip for Adreno) to pack in the APK and use instead of the device\'s own driver '
-                         '(DM_VK_DRIVER in env.txt); the app falls back to the device\'s driver when the library does not load')
+                         '(DM_VK_DRIVER in env.txt); the app falls back to the device\'s driver when the library does not load. A library not named lib*.so '
+                         '(vulkan.purple.so) is packed as lib<name>, the only names Android extracts. A profile with vulkan_driver turnip gets Turnip without it (porter config turnip); '
+                         '"system" keeps the device\'s driver')
     po.add_argument('--shared-font', default=None, metavar='FILE',
                     help='a TrueType font (.ttf, one font, not a collection) to pack as the system font the game asks for, instead of the device\'s Roboto: one with CJK '
                          'characters shows the Chinese and Korean text of a game that draws it with the system font (DM_SHARED_FONT in env.txt); never shipped with the tool')
+    po.add_argument('--firmware', default=None, metavar='DIR',
+                    help="a folder of your console's system content files (.nca: its firmware dump, NAND SYSTEM Contents/registered) for a game that reads system data "
+                         "(android.tsv sysdata: Mario Kart 8 Deluxe's Mii heads come from MiiModel); never shipped with the tool (default: the configured one)")
     po.add_argument('--vercode-offset', type=int, default=None, metavar='N',
                     help='add N (0-65535) to the APK\'s versionCode, so a rebuild of the same game version installs over a build with a higher one and keeps its saves '
                          '(default: $NX2A_VERCODE_OFFSET, else 0)')
@@ -76,6 +85,16 @@ def _parser():
     for x in (sa, sl, se, si):
         x.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)'); x.add_argument('--json', action='store_true')
         if x is not sa: x.add_argument('--package', default='', help='the app (default: the only ported game installed)')
+    dr = sub.add_parser('driver', help='another Vulkan driver for a port on the device, without the game files: its APK is rebuilt with the library and signed again (the saves stay)')
+    drg = dr.add_mutually_exclusive_group(required=True)
+    drg.add_argument('library', nargs='?', help='the driver library (.so, such as Mesa\'s Turnip); the app must have been ported with --vulkan-driver once')
+    drg.add_argument('--system', action='store_true', help='no driver library: the device\'s own driver')
+    dr.add_argument('--package', default='', help='the app (default: the only ported game installed)')
+    dr.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)'); dr.add_argument('--json', action='store_true')
+    hs = sub.add_parser('host', help="a port on the device brought to this version's host, without the game files: its libdmhost.so is built again from the profile (the saves and the game's data stay)")
+    hs.add_argument('--package', default='', help='the app (default: the only ported game installed)')
+    hs.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)')
+    hs.add_argument('--jobs', type=int, default=os.cpu_count() or 8); hs.add_argument('--json', action='store_true')
     return ap
 
 
@@ -83,7 +102,7 @@ def _romfs_at(p, when=''):   # install's --romfs-at / --romfs-push (porter/insta
     p.add_argument('--romfs-at', default=None, metavar='FOLDER',
                    help=when + 'read the game\'s RomFS from this folder on the device (e.g. /sdcard/Games/<game>/romfs, a dump another app also reads, or a folder on the SD card) '
                         'instead of a copy in the app\'s files folder: the folder must hold exactly the pack\'s RomFS (names and sizes, and the content of a sample), the app is given All files access, '
-                        'and a copy an earlier install left in the files folder is deleted. Later installs keep the folder; "app" moves the RomFS back into the files folder')
+                        'and a copy an earlier install left in the files folder is deleted. Later installs keep the folder; "app" moves the RomFS back into the files folder; "sd" pushes it into <the SD card>/Android/data/<package>/files/RomFS, the app\'s own folder there (Android removes it when the app is uninstalled; the APK stays in internal storage; later installs push what changed into it and remove files that are not the pack\'s; a USB drive only when no SD card is mounted); "no-sd" moves data an earlier "sd" install put on the card back into the app files folder, else changes nothing')
     p.add_argument('--romfs-push', action='store_true', help='with --romfs-at: push the pack\'s RomFS into that folder first (an empty folder, or one of this game; nothing there is deleted)')
 
 
@@ -108,9 +127,12 @@ def cmd_profiles(a):
 
 
 def cmd_inspect(a):
+    import contextlib
     from porter import pipeline
     from porter.upstream import BuildError
-    try: info = pipeline.inspect(a.folder, a.keys)
+    try:
+        with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):
+            info = pipeline.inspect(a.folder, a.keys)   # keep JSON stdout one document for the GUI
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)
@@ -158,10 +180,7 @@ def cmd_port(a):
     from porter.upstream import BuildError
     try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
     except BuildError as e: print(e, file=sys.stderr); return 2
-    opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
-                            app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, jobs=a.jobs,
-                            framegen=a.framegen or (a.lsfg_dll is not None), lsfg_dll=Path(a.lsfg_dll).resolve() if a.lsfg_dll else None)
+    opts = pipeline.Options.from_args(a, vercode_offset=offset, framegen=a.framegen or (a.lsfg_dll is not None), lsfg_dll=Path(a.lsfg_dll).resolve() if a.lsfg_dll else None)   # every other field from the argument of its name
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -261,7 +280,28 @@ def cmd_lsfg_extract(a):
     return 0
 
 
+def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt without the game files
+    import contextlib
+    from porter import config, driver, host, paths, saves, toolchain
+    from porter.upstream import BuildError
+    try:
+        with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):   # with --json, stdout is the one JSON document
+            cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device'))
+            lock = adb.hold(paths.user_dir())   # they reinstall the APK: not while porter install runs on the device
+            try:
+                out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library) if a.cmd == 'driver' else \
+                      host.update(adb, saves.pick_app(adb, a.package), a.jobs)
+            finally:
+                if lock: lock.close()
+    except BuildError as e:
+        if a.json: _print_json({'error': str(e)})
+        else: print(e, file=sys.stderr)
+        return 1
+    if a.json: _print_json(out)
+    return 0
+
+
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'lsfg_extract': cmd_lsfg_extract}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'lsfg_extract': cmd_lsfg_extract}[a.cmd](a)

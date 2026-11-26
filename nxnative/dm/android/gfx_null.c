@@ -1,6 +1,6 @@
 // Android port, stage 1: a null graphics backend behind the replay interface of nvn_mtl.h (the Metal backend's functions).
 // Nothing is drawn. Everything the CPU can observe of the GPU's work is honoured, so a game's own logic runs as on the device:
-//   · a submission completes at once: events are written / added, counters get {value, timestamp} (19.2 MHz guest ticks), FenceSync objects take the
+//   · a submission completes at once: events are written / added, counters get {value, timestamp} (guest ticks at the profile's gpu_tick_rate), FenceSync objects take the
 //     submission's fence and every fence counts as passed;
 //   · buffer copies, fills and inline uniform updates are done in order with plain memory operations (pool memory is the guest's own memory);
 //   · samples-passed counters report many samples (everything visible) rather than 0 (everything culled).
@@ -14,7 +14,7 @@
 #include <time.h>
 
 uint64_t guest_ns(void);
-static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * 12 / 625; }
+static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * DM_GAME_GPU_TICK_NUM / 625; }   // profile gpu_tick_rate
 
 // ---------------- memory pools: GPU address = CPU address ----------------
 typedef struct { uint64_t lo, hi; } pool_ent;
@@ -65,7 +65,7 @@ void mtl_exec(const uint8_t *p) {
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8); mtl_exec((const uint8_t *)(uintptr_t)t); break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
-        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = 1; break; }
+        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); sync_replay_fence(s, g_fence + 1); break; }
         case OP_CLEAR_BUF: { const p_clear_buf *cb = (const p_clear_buf *)a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, n); break; }

@@ -84,6 +84,18 @@ def dotnet_root(dotnet):
     return Path(next(iter(sdks.values()))).parent if sdks else Path(dotnet).resolve().parent
 
 
+def find_turnip(cfg=None):
+    """Mesa's Turnip Vulkan driver for a profile with `vulkan_driver turnip`: the `turnip` setting (porter config turnip <libvulkan_freedreno.so>), else a build
+    under tools/turnip (the developer's) or the player's tools folder. None when there is none"""
+    if cfg and cfg.get('turnip'):
+        p = Path(cfg['turnip']).expanduser()
+        return p if p.is_file() else None
+    for t in (LOCAL_TOOLS, player_tools()):
+        hits = sorted(glob.glob(str(t / 'turnip' / '**' / 'libvulkan_freedreno.so'), recursive=True))
+        if hits: return Path(hits[0])
+    return None
+
+
 def find_adb(cfg=None):
     cfg = cfg if cfg is not None else config.load()
     for c in [cfg.get('adb'), shutil.which('adb'), *[str(r / 'platform-tools' / f'adb{EXE}') for r in _sdk_roots()], str(LOCAL_TOOLS / 'platform-tools' / f'adb{EXE}'), str(player_tools() / 'platform-tools' / f'adb{EXE}')]:
@@ -94,6 +106,30 @@ def find_adb(cfg=None):
 def _importable(m):
     try: return importlib.util.find_spec(m) is not None
     except (ImportError, ValueError): return False
+
+
+def keys_check(path):
+    """A prod.keys file's own state: the file is there and it holds the keys a dump needs. Only the names are read, never
+    the values: a title.keys file renamed as prod.keys passes the file check and then fails every NCA header at the extract
+    (the header key is derived from master_key_00, so a keyset without it opens nothing; a keyset with only derived keys
+    (header_key, key_area_key_application_*, titlekek_*) opens what it holds, so it is not refused either).
+    → (ok, detail, fix)"""
+    if not path: return False, 'not set', 'dump prod.keys from your own Switch and set its path'
+    p = Path(path)
+    if not p.is_file(): return False, f'no such file: {path}', 'dump prod.keys from your own Switch and set its path'
+    names = set()
+    try:
+        with p.open('r', errors='replace') as f:
+            for ln in f:
+                # LibHac 0.19.0 (the reader of nx_extract) takes '=' or ',' between the name and the value, and reads the names in any case
+                k = re.split('[=,]', ln, maxsplit=1)[0].strip().lower()
+                if k: names.add(k)
+    except OSError as e:
+        return False, f'{path}: cannot be read ({e})', 'dump prod.keys from your own Switch and set its path'
+    masters = sorted(n for n in names if n.startswith('master_key_'))
+    if 'master_key_00' not in names and 'header_key' not in names:
+        return False, f'{path}: no master_key_00 and no header_key in it ({len(masters)} master keys)', 'dump prod.keys from your own Switch'
+    return True, f'{path} ({len(names)} keys, {len(masters)} master keys)', ''
 
 
 def checks(cfg=None, keys=None):
@@ -121,8 +157,8 @@ def checks(cfg=None, keys=None):
     out.append(Check('adb', bool(adb), str(adb) if adb else 'not found: the tool cannot install on a device (the APK and data pack are still made)', required=False, path=str(adb or ''),
                      fix='' if adb else 'Download missing tools, or install Android platform-tools'))
     k = keys or cfg.get('keys')
-    out.append(Check('prod.keys', bool(k) and Path(k).is_file(), k if k and Path(k).is_file() else (f'no such file: {k}' if k else 'not set'), path=k or '',
-                     fix='' if k and Path(k).is_file() else 'dump prod.keys from your own Switch and set its path'))
+    kok, kdetail, kfix = keys_check(k)
+    out.append(Check('prod.keys', kok, kdetail, path=k or '', fix=kfix))
     where = Path(cfg.get('out') or Path.home())   # the output folder's drive, or the home folder's (a port's build folder goes beside the game files: the port checks that drive itself)
     where = next((p for p in (where, *where.parents) if p.exists()), Path.home())
     free = shutil.disk_usage(where).free / 2**30

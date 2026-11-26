@@ -11,6 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "audio_route_policy.h"
+
+// AAudio's Binder/AIDL setup must not run on a small guest thread stack. FIFA 21's audio submit thread overflowed into its guard page in
+// libaudioclient_aidl_conversion on Android 17. Use the same per-thread big-stack entry as GL; callbacks still use AAudio's own threads.
+OSStatus dm_aaudio_big(OSStatus (*fn)(AudioUnit), AudioUnit u);
+__asm__(".text\n.p2align 2\n.globl dm_aaudio_big\n.hidden dm_aaudio_big\ndm_aaudio_big:\n    mov x16, x0\n    mov x0, x1\n    b dm_bigstack_enter\n");
 
 struct dm_audio_component { int unused; };
 struct dm_audio_unit {
@@ -28,6 +34,8 @@ struct dm_audio_unit {
 static struct dm_audio_component g_output;
 static _Atomic int32_t g_output_device;
 void dm_aaudio_set_device(int32_t id) { atomic_store(&g_output_device, id); }
+int32_t dm_aaudio_get_device(void) { return atomic_load(&g_output_device); }
+int dm_aaudio_route_stale(AudioUnit u) { return u && u->requested_device != atomic_load(&g_output_device); }
 
 AudioComponent AudioComponentFindNext(AudioComponent after, const AudioComponentDescription *d) {
     return !after && d && d->componentType == kAudioUnitType_Output ? &g_output : NULL;
@@ -69,7 +77,10 @@ static aaudio_data_callback_result_t on_data(AAudioStream *st, void *ud, void *a
     atomic_fetch_sub(&u->in_cb, 1); (void)st; return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 static void on_error(AAudioStream *st, void *ud, aaudio_result_t err) {
-    (void)st; atomic_store(&((AudioUnit)ud)->failed, 1); __android_log_print(ANDROID_LOG_WARN, "dmhost", "AAudio stream error %d (%s): the host's watchdog restarts it", err, AAudio_convertResultToText(err));
+    (void)st; AudioUnit u = ud; atomic_store(&u->failed, 1);
+    if (err == AAUDIO_ERROR_DISCONNECTED && audio_route_fallback(&g_output_device, u->requested_device))
+        __android_log_print(ANDROID_LOG_WARN, "dmhost", "AAudio selected device disconnected; falling back to system output");
+    __android_log_print(ANDROID_LOG_WARN, "dmhost", "AAudio stream error %d (%s): the host's watchdog restarts it", err, AAudio_convertResultToText(err));
 }
 // requestStop only asks: the data callback may still be running after it returns, and the host frees the output it pulls from once the unit is stopped
 // (hle_audio.c au_close; games close and open outputs when the operation mode changes). So ending a stream (uninitialize, dispose, opening a new one) waits
@@ -86,7 +97,7 @@ static void stop_stream(AudioUnit u) {
     if (s != AAUDIO_STREAM_STATE_STOPPED) close_stream(u);
 }
 
-OSStatus AudioOutputUnitStart(AudioUnit u) {
+static OSStatus start_unit(AudioUnit u) {
     // A stop and start (the pause menu holds the game, the app goes to the background) go on with the same stream, which played silence meanwhile. Each new
     // stream is a new AudioFlinger track, and on the Legion Y700 the app's first was a fast track (bypassing the output's Dolby DAP effect), the ones after it
     // normal mixer tracks through it: the sound got louder after the pause menu (13 Sentinels, four toggles: track 1536 frames fast, then four of 2886; the
@@ -125,6 +136,7 @@ OSStatus AudioOutputUnitStart(AudioUnit u) {
     if (r != AAUDIO_OK) { close_stream(u); return r; }
     return noErr;
 }
+OSStatus AudioOutputUnitStart(AudioUnit u) { return dm_aaudio_big(start_unit, u); }
 // A stop holds the stream (silence, see AudioOutputUnitStart): once it returns no callback is inside the host's render callback, and none enters it until
 // the next start (held is set before in_cb is read, and each callback counts itself in before it reads held)
 OSStatus AudioOutputUnitStop(AudioUnit u) {
@@ -133,6 +145,8 @@ OSStatus AudioOutputUnitStop(AudioUnit u) {
     while (atomic_load(&u->in_cb)) sched_yield();
     u->stop_time = atomic_load(&u->sample_time); return noErr;
 }
-OSStatus AudioUnitUninitialize(AudioUnit u) { stop_stream(u); close_stream(u); return noErr; }
-OSStatus AudioComponentInstanceDispose(AudioComponentInstance u) { if (u) { stop_stream(u); close_stream(u); free(u); } return noErr; }
+static OSStatus uninitialize_unit(AudioUnit u) { stop_stream(u); close_stream(u); return noErr; }
+static OSStatus dispose_unit(AudioUnit u) { if (u) { stop_stream(u); close_stream(u); free(u); } return noErr; }
+OSStatus AudioUnitUninitialize(AudioUnit u) { return dm_aaudio_big(uninitialize_unit, u); }
+OSStatus AudioComponentInstanceDispose(AudioComponentInstance u) { return dm_aaudio_big(dispose_unit, u); }
 // AudioConverter (AAC → PCM) is on MediaCodec: dm/android/compat/audioconverter_mediacodec.c

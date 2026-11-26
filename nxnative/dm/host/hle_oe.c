@@ -52,6 +52,7 @@ void dm_set_opmode(int m) {   // called by the front end (overheat downgrade etc
     int old = dm_opmode(); if (old == m) return;
     g_opmode = m;
     LOG("oe operation mode %d → %d", old, m);
+    dm_hid_opmode_changed();   // player 1's controller moves between the Handheld and No1 npads (hle_hid.c)
     if (g_ntf_opmode) mq_push(MSG_OPMODE);
     if (g_ntf_perfmode) mq_push(MSG_PERFMODE);
 }
@@ -99,6 +100,10 @@ HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recordin
 HLE_FORCE("_ZN2nn2oe15UnmuteRecordingEv", "unmute the sound of system video recording; the host has no system recording", void, h_oe_UnmuteRec, void) {}
 HLE_FORCE("_ZN2nn2oe16EnableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_EnableShot, void) {}
 HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "screenshot switch; the host has no system screenshot", void, h_oe_DisableShot, void) {}
+// FIFA 21 (SDK 9.6) reaches DisableCrashReport at sdk+0x299ce0 after its first present. The SDK calls am's application proxy, which the host does not create.
+// These switches control Horizon's report service only; the host keeps its own crash handler and logs regardless of the game's reporting preference.
+HLE_FORCE("_ZN2nn2oe17EnableCrashReportEv", "enable Horizon system crash reporting; the host has no system report service", void, h_oe_EnableCrashReport, void) {}
+HLE_FORCE("_ZN2nn2oe18DisableCrashReportEv", "disable Horizon system crash reporting; the host has no system report service", void, h_oe_DisableCrashReport, void) {}
 // Super Mario Odyssey: HOME button blocking around its own menus, screenshot orientation, and the auto-sleep query (all through am)
 HLE_FORCE("_ZN2nn2oe23BeginBlockingHomeButtonEv", "temporarily block the HOME button (through am); the host has no HOME button", void, h_oe_BlockHome, void) {}
 HLE_FORCE("_ZN2nn2oe21EndBlockingHomeButtonEv", "restore the HOME button (through am)", void, h_oe_UnblockHome, void) {}
